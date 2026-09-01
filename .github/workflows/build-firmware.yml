@@ -16,6 +16,7 @@ on:
         default: 'v6.0.2'
 
 permissions:
+  contents: write
 
 jobs:
   build:
@@ -24,6 +25,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: ver
+        run: echo "calver=$(date -u +%Y.%m.%d)-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
       - name: Regenerate dependency lock for this IDF
         # committed lock has hashes from an older component manager; IDF 6 rejects them
@@ -44,12 +50,13 @@ jobs:
           cp build/bootloader/bootloader.bin artifacts/
           cp build/partition_table/partition-table.bin artifacts/
           cp build/flasher_args.json artifacts/
+          echo "${{ steps.ver.outputs.calver }} (${{ github.sha }})" > artifacts/BUILD_INFO.txt
           ls -la artifacts
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: wican-fw-obd-pro-${{ github.ref_name }}-${{ github.run_number }}
+          name: wican-fw-obd-pro-${{ steps.ver.outputs.calver }}
           path: artifacts/
           if-no-files-found: error
           retention-days: 30
@@ -57,9 +64,9 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: build-${{ github.run_number }}-${{ github.ref_name }}
+          tag_name: v${{ steps.ver.outputs.calver }}
           target_commitish: ${{ github.sha }}
-          name: "WiCAN Pro firmware — ${{ github.ref_name }} (build ${{ github.run_number }})"
+          name: "WiCAN Pro firmware v${{ steps.ver.outputs.calver }}"
           body_path: artifacts/BUILD_INFO.txt
           files: artifacts/*
           prerelease: false

@@ -4094,6 +4094,7 @@ xhttp.onload = async function() {
             document.getElementById("log_storage").selectedIndex = "1";
         }
 
+        document.getElementById('log_period').value = obj.log_period;
         document.getElementById('log_period_value').textContent = obj.log_period;
         
         // Load IMU threshold value and update display

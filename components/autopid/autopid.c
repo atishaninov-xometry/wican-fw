@@ -51,7 +51,6 @@
 #include "ha_webhooks.h"
 #include "autopid_config.h"
 #include "esp_heap_caps.h"
-#include "sdcard.h"
 #include <sys/stat.h>
 #include <stdio.h>
 
@@ -446,42 +445,6 @@ static uint8_t autopid_std_pid_data_len(uint8_t pid_num)
     return (max_end >= 3) ? (max_end - 3) : 0;
 }
 
-// Appends one row to /sdcard/obd_logs/batch_timing.csv per batched request,
-// to measure real round-trip latency against the ND3 gateway on-car.
-#define AUTOPID_BATCH_TIMING_LOG_PATH DB_ROOT_PATH "/" DB_DIR_NAME "/batch_timing.csv"
-
-static void autopid_log_batch_timing(const char *pid_hex_list, uint32_t round_trip_ms, bool success)
-{
-    if (!sdcard_is_mounted())
-    {
-        return;
-    }
-
-    mkdir(DB_ROOT_PATH "/" DB_DIR_NAME, 0755); // ignore EEXIST
-
-    struct stat st;
-    bool need_header = (stat(AUTOPID_BATCH_TIMING_LOG_PATH, &st) != 0);
-
-    FILE *f = fopen(AUTOPID_BATCH_TIMING_LOG_PATH, "a");
-    if (!f)
-    {
-        return;
-    }
-    if (need_header)
-    {
-        fprintf(f, "timestamp_utc,pids,round_trip_ms,success\n");
-    }
-
-    char ts[32] = {0};
-    time_t now = time(NULL);
-    struct tm tm_now;
-    gmtime_r(&now, &tm_now);
-    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_now);
-
-    fprintf(f, "%s,%s,%lu,%d\n", ts, pid_hex_list, (unsigned long)round_trip_ms, success ? 1 : 0);
-    fclose(f);
-}
-
 // Poll every due Standard PID in one batched Mode-01 request instead of one
 // request per PID. Re-arms the timer for every PID it services, so the
 // per-PID loop below just finds it not due and skips it.
@@ -583,7 +546,6 @@ static void autopid_poll_std_pids_batched(pid_type_t *previous_pid_type)
     uint8_t pid_len[AUTOPID_STD_BATCH_MAX] = {0};
     bool pid_ok[AUTOPID_STD_BATCH_MAX] = {false};
     bool batch_ok = false;
-    int64_t request_start_us = esp_timer_get_time();
 
     if (elm327_process_cmd((uint8_t *)cmd, cmd_len, &autopidQueue, elm327_autopid_cmd_buffer, &elm327_autopid_cmd_buffer_len, &elm327_autopid_last_cmd_time, autopid_parser) == ESP_OK)
     {
@@ -641,14 +603,6 @@ static void autopid_poll_std_pids_batched(pid_type_t *previous_pid_type)
     {
         ESP_LOGE(TAG, "Failed to send batched std PID command: %s", cmd);
     }
-
-    uint32_t round_trip_ms = (uint32_t)((esp_timer_get_time() - request_start_us) / 1000);
-    char pid_list_str[AUTOPID_STD_BATCH_MAX * 2 + 1] = {0};
-    for (uint32_t b = 0; b < batch_count; b++)
-    {
-        snprintf(&pid_list_str[b * 2], 3, "%02X", batch_pids[b]);
-    }
-    autopid_log_batch_timing(pid_list_str, round_trip_ms, batch_ok);
 
     for (uint32_t a = 0; a < apply_count; a++)
     {

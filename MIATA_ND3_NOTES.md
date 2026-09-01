@@ -1,0 +1,62 @@
+# ND3 telemetry firmware fork — working notes / handoff
+
+Context for continuing this fork (offline telemetry for a **2025 Mazda MX-5 ND3, manual**, via a **WiCAN Pro** OBD adapter). This file is the durable handoff: everything non-obvious lives here so work can continue in cloud/CI without the original local machine.
+
+## TL;DR status
+- Fork of `meatpiHQ/wican-fw`. Active branch: **`sd-logging-patches-v4.51p-beta01`** (base tag `v4.51p_beta-01`, ESP-IDF **v6.0.2**, GCC 15.2.0). Local-only fallback branch `sd-logging-patches-v4.50p` (base `v4.50p`, IDF 5.3.3, keeps CMakeLists build workarounds).
+- **Builds are now done in GitHub Actions** (`.github/workflows/build-firmware.yml`) — push to a `sd-logging-patches-*` branch (or run the workflow manually) → download the artifact → OTA-flash the `wican-fw_obd_pro_*.bin`. No local WSL needed.
+- v4.51 branch builds **clean on IDF 6 with NO toolchain workarounds** (all the IDF-5.3.3 `-Wno-error`/`-Wl,--allow-multiple-definition` hacks were dropped).
+
+## Patches in this fork (all on both branches)
+1. **1 s SD logging** — homepage logger slider min 10→1; `config_server.c` `log_period` parse/clamp [1,300]s.
+2. **Manual RTC time (no NTP)** — `rtcm_set_from_unix()` (settimeofday + RX8130 BCD write); `POST /set_time`, `GET /get_time`; a **"Time" web tab** with: device time, "Borrow browser time" (stages phone clock), "Commit to RTC", and **"Sync from internet (NTP-like)"** (the phone's browser fetches UTC from timeapi.io/worldtimeapi.org and POSTs to /set_time — WiCAN stays offline).
+3. **SD safe-eject button** (`main.c`, WICAN_PRO) — hold GPIO8 ~3 s while running → flush WAL + close SQLite + unmount FATFS; LED yellow=flushing, green=safe, red=error.
+4. **Auto-flush SD on engine-off/sleep** (`sleep_mode.c`) — checkpoint+close+unmount in LOW_VOLTAGE→SLEEPING; wake does a full restart so the card remounts clean.
+5. **Web-UI fix** — httpd `max_uri_handlers` 38→48 (the two new /set_time,/get_time handlers overflowed the limit and killed the wildcard static handler → whole UI broke).
+6. **Periodic wakeup up to 24 h** — slider max 240→1440 min + `config_server_get_wakeup_interval` clamp →1440. Safe: `wc_timer` uses uint64 µs.
+7. **Throughput, part 1** — inter-request gap 100 ms → **5 ms** (`AUTOPID_INTER_REQUEST_GAP_MS`, autopid.c). Part 2 (batching) is **DONE** — see below.
+8. **"Debug" web tab (removed).** Ran on-car checks (connection, multi-PID batching, DSC header reset) via buttons instead of hand-typed Terminal commands — it did its job (see the batching capture below) and was removed once no longer needed. If similar checks are needed again, `git log` this file's history for `debug_tab`/`main/web/src/debug.js`.
+9. **Fixed a real bug found while building the above**: `terminal.js`'s ELM327 mode sent commands as a raw CR-terminated WS text frame (`sendText`), but `ws_router_handle_frame` only dispatches terminal commands wrapped in JSON (`{"cmd":"..."}`) — a non-`{`-prefixed frame returns unhandled and falls into the raw `DEV_WIFI_WS` monitor queue instead of ever reaching `elm327_run_command`. **This is why manually typing `010C` in the Terminal tab produced no response at all** (not a missing-init issue, no partial output ever arrived). Fixed by sending `{cmd:...}` for both terminal types. Also bumped the terminal's per-command ELM327 response wait from 2000ms → 4000ms as a margin for a cold `ATZ`/first read (untested on hardware, low-risk since it only widens a manual-debug wait window).
+10. **Multi-PID Mode-01 batching, implemented** (`components/autopid/autopid.c`, `autopid_poll_std_pids_batched()` + `autopid_isotp_reassemble()` + `autopid_std_pid_data_len()`) — see "RESOLVED: OBD poll throughput" below for the full story.
+
+## ✅ RESOLVED: OBD poll throughput (multi-PID batching)
+**Was:** standard PIDs logged at ~10 s regardless of the per-PID Period, because the poll loop sent one Mode-01 request per PID sequentially over the slow ND3 gateway — one full pass ≈10 s, so everything sampled at pass-rate.
+
+**Confirmed on-car 2026-09-01** via the Debug tab's "Test multi-PID batching" (raw capture below) — the ND3 gateway happily answers a **6-PID batched Mode-01 request in one shot**:
+```
+> 010C0D0F11052F
+7E8 10 0E 41 0C 0B 1C 0D 00
+7E8 21 0F 55 11 1D 05 8A 2F
+7E8 22 DF 00 00 00 00 00 00
+```
+Reassembled (First Frame + 2 Consecutive Frames, standard ISO-TP): `41 0C 0B1C 0D 00 0F 55 11 1D 05 8A 2F DF` → RPM 711, Speed 0, IntakeTemp 45°C, Throttle 11.4%, Coolant 98°C, Fuel 87.5% — every value physically sane, throttle position matched exactly across two separate polls seconds apart. **Wire format: ONE leading `0x41`, then concatenated `(PID, data...)` pairs in request order — not `41 PID data` repeated per PID.** That one fact broke the Debug tab's own first-pass verdict parser too (it assumed a repeated `41`, so it always undercounted — fixed in `debug.js`'s `decodeMultiPidBatch`/`isotpReassemble`, verified against this exact capture).
+
+**Implemented in `autopid.c`:**
+- `autopid_isotp_reassemble()` — classic (non-FD, 8-byte-frame) ISO-TP reassembly from the bytes `parse_elm327_response()` already concatenates into `response->data` (that function keeps PCI bytes in-band, one physical CAN frame = one 8-byte chunk — reused as-is rather than touching that parser).
+- `autopid_std_pid_data_len()` — canonical data length per PID from the existing `obd2_standard_pids.h` table (independent of which of that PID's params happen to be enabled).
+- `autopid_poll_std_pids_batched()` — called once per poll pass, **before** the existing per-PID loop. Collects up to 6 unique due `PID_STD` PIDs (de-duping when two enabled params share one PID, e.g. two bit-ranges of the same response), sends `01`+concat as one request, reassembles, walks PID-by-PID building a synthetic `[0x00][0x41][PID][data...]` buffer per PID and reusing the existing `extract_signal_value()` unchanged (lowest-risk reuse, exactly as planned). Any PID it services gets its timer re-armed immediately, so the old per-PID loop below just finds it not-due and skips it — **no restructuring of the existing loop**, `PID_CUSTOM`/`PID_SPECIFIC` are completely untouched. Fail-safe: on any PID-marker mismatch mid-batch, everything from that point on in the batch is marked failed rather than guessed; already-decoded earlier PIDs in the same batch stand.
+- **Also fixes the DSC-header-stuck TODO as a side effect**: every batch unconditionally resends `standard_init` (protocol + `ATSH7DF`) right before sending, so a custom/specific PID leaving the header on 760 can no longer wedge standard PIDs for the rest of the drive. (The chip-level reset was independently confirmed clean in the same Debug-tab session — see the DSC finding below.)
+- **Not yet done / worth re-testing on-car:** whether ALL currently-enabled standard PIDs actually batch together correctly at real drive conditions (only RPM/Speed/IntakeTemp/Throttle/Coolant/Fuel were on the confirmed capture) — the resync fail-safe means a bad PID just fails gracefully rather than corrupting others, but watch the first drive log for it.
+
+## Key ND3 findings (validated)
+
+## Key ND3 findings (validated)
+- **ND3 = CX-60-gen electronics. OBD port exposes ONLY diagnostic req/resp (Mode 01/06/09/22) — NO raw broadcast frames.** Raw sniffing at OBD sees only poll responses. Many-signals-at-high-rate needs an internal bus tap (not the OBD port). Ref: https://github.com/drewid74/2024-nd3-mazda-obdii
+- **Gear decode: gear is in the HIGH NIBBLE of byte B → `B4/16`.** GearStatus (PID 01A4): 0=Neutral, 1..6=gear. RecommendedGear (PID 0165): 0=none, 2..6=shift-up hint. The Standard-tab "A4 gear RATIO" is noisy on ND3 — use the enum.
+- **Steering is DEAD at the OBD port.** DSC PIDs 22 2033/2034 respond but never vary; 201D constant, 201F NO DATA. Needs an internal tap.
+- **DSC (header 760) PIDs BREAK the standard engine PIDs — but only because the firmware didn't reset the header, not a chip limitation.** Confirmed on-car 2026-09-01 (Debug tab "Test DSC header reset"): baseline `010C` → `ATSH760`+`222033` → `ATSH7DF` → follow-up `010C` all succeeded (RPM 714→711) — the raw ELM/CAN link resets cleanly at the chip level. The real bug was the poll loop only resending `standard_init`/`ATSH7DF` on a `pid_type` transition, which a 760 query didn't reliably trigger for every subsequent standard poll. **Fixed as a side effect of the batching poller** (`autopid_poll_std_pids_batched()` resends `standard_init` unconditionally before every batch) — worth re-adding brake pressure / re-testing DSC-alongside-standard on the next drive to confirm end-to-end, not just the manual chip-level probe.
+- **Expression parser** (`main/expression_parser.c`): `+ - * /`, bitwise `& | ^`, shifts `<< >>`, parens. Operands: number, V, `Bn`(unsigned byte), `Sn`(SIGNED byte), `[Bn:Bm]`(unsigned multi-byte), `[Sn:Sm]`(SIGNED multi-byte), `Bn:bit`. **NO comparison (`< > ==`), NO functions.** For signed use `[Sn:Sm]` — NOT `(Bn>127)*65536` (fails eval).
+- **AutoPID profile IMPORT format:** must be the **array/converted form** (`parameters:[{name,expression,unit,class,min,max,type,period,send_to}]`). The shorthand map form (`parameters:{Name:"expr"}`) makes the UI fetch `params.json` from GitHub with no timeout → **hangs forever offline**. (main.js:454 = array form skips the fetch.)
+- Byte index: mode01 A=B3,B=B4,C=B5,D=B6; mode22 A=B4,B=B5.
+
+## Vehicle profile (separate project)
+The custom AutoPID profile + full decode notes live in the user's `miata-telemetry` project: `imports/nd3_wican_autopid.json` (7DF-only: FuelLevel_L/FuelEmpty_L @012F, GearStatus @01A4 B4/16, RecommendedGear @0165 B4/16) and `imports/nd3_autopid_notes.md`. Fuel: `FuelLevel_L=B3*45/255` (45 = assumed tank litres; recalibrate with a known fill vs `2F` %).
+
+## SD logging facts
+- AutoPID SD logger = SQLite under `/sdcard/obd_logs`, decoded PIDs only, **delta-logging** (only changed values), `synchronous=OFF` during inserts (nothing durable until checkpoint/unmount — hence the safe-eject/sleep-flush patches). Rollover at **4 MB/file**, keep newest **100** files (count-based only, no free-space guard). Param IDs are **per-file** (each rotated .db recreates `param_info`) — map through each file's own `param_info` when merging. `db_index.json` = the file manifest.
+- **Extract a log cleanly:** engine-off (auto-flush) or safe-eject (green LED) BEFORE downloading, else a live web-UI download of the active .db can be 0 bytes / missing WAL rows.
+
+## Build / flash quick reference
+- CI: push to `sd-logging-patches-*` or run **Actions → "Build firmware (WiCAN Pro, IDF 6)"**. Every successful build is now also published as a **GitHub Release** (`build-<run_number>-<branch>` tag, `softprops/action-gh-release`, `target_commitish` pinned to the actual built commit — don't omit that input, it defaults to `main` otherwise and the release silently stops showing up against the real commit) — `.../releases/latest` always resolves to the newest one; the 30-day-expiring Actions artifact (`wican-fw-obd-pro-*`) still exists too if you'd rather grab it from the run page. `actions/checkout`/`actions/upload-artifact` are pinned to `@v7` (bumped from `@v4`); `espressif/esp-idf-ci-action@v1` is already latest.
+- OTA flash: web UI → **System → Firmware Update** → upload `wican-fw_obd_pro_*.bin` (rollback is DISABLED in this build, so keep a USB recovery path). USB full-flash offsets: 0x0 bootloader, 0x8000 partition-table, 0xd000 ota_data_initial, 0x10000 app (chip esp32s3, dio, 16 MB, 80 m).
+- WiCAN Pro AP default UI: `http://192.168.0.10`, AP pass `@meatpi#`. Version = About tab.

@@ -1,0 +1,29 @@
+{
+  "car_model": "Mazda MX-5 ND3 (2024+) — 7DF-only (gaps)",
+  "init": "ATSP6;ATST96;",
+  "can_filters": [],
+  "pids": [
+    {
+      "pid": "012F1",
+      "pid_init": "ATSH7DF;",
+      "parameters": [
+        { "name": "FuelLevel_L", "expression": "B3*45/255", "unit": "L", "class": "none", "min": "", "max": "", "type": "Default", "period": "10000", "send_to": "" },
+        { "name": "FuelEmpty_L", "expression": "45-(B3*45/255)", "unit": "L", "class": "none", "min": "", "max": "", "type": "Default", "period": "10000", "send_to": "" }
+      ]
+    },
+    {
+      "pid": "01A41",
+      "pid_init": "ATSH7DF;",
+      "parameters": [
+        { "name": "GearStatus", "expression": "B4/16", "unit": "", "class": "none", "min": "", "max": "", "type": "Default", "period": "1000", "send_to": "" }
+      ]
+    },
+    {
+      "pid": "01651",
+      "pid_init": "ATSH7DF;",
+      "parameters": [
+        { "name": "RecommendedGear", "expression": "B4/16", "unit": "", "class": "none", "min": "", "max": "", "type": "Default", "period": "2000", "send_to": "" }
+      ]
+    }
+  ]
+}

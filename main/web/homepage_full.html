@@ -1898,7 +1898,22 @@
                     </td>
                 </tr>
                 <tr>
-                    <td>Log Period:</td>
+                    <td>Poll Interval:</td>
+                    <td class="slider-container">
+                        <input type="range"
+                            id="log_poll_period"
+                            name="log_poll_period"
+                            value="1"
+                            min="1"
+                            max="300"
+                            step="1"
+                            oninput="document.getElementById('log_poll_period_value').textContent = this.value;submit_enable();">
+                        <span id="log_poll_period_value">1</span>sec
+                        &nbsp;(how often live values are sampled into RAM; free, no SD wear)
+                    </td>
+                </tr>
+                <tr>
+                    <td>SD Write Interval:</td>
                     <td class="slider-container">
                         <input type="range"
                             id="log_period"
@@ -1909,7 +1924,7 @@
                             step="1"
                             oninput="document.getElementById('log_period_value').textContent = this.value;submit_enable();">
                         <span id="log_period_value">10</span>sec
-                        &nbsp;(1&nbsp;=&nbsp;1&nbsp;Hz)
+                        &nbsp;(how often sampled values are flushed to the SD card)
                     </td>
                 </tr>
             </table>

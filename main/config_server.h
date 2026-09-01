@@ -164,6 +164,7 @@ typedef struct _device_config
 	char log_storage[16];
 	char log_filesystem[16];
 	char log_period[16];
+	char log_poll_period[16];
 	char imu_threshold[16];
 	bool debug_enabled;
 }device_config_t;
@@ -240,6 +241,7 @@ int8_t config_server_get_wakeup_time(uint32_t *wakeup_time);
 wifi_security_t config_server_get_sta_security(void);
 int8_t config_server_get_logger_config(void);
 int8_t config_server_get_log_period(uint32_t *log_period);
+int8_t config_server_get_log_poll_period(uint32_t *log_poll_period);
 log_storage_t config_server_get_log_storage(void);
 log_filesystem_t config_server_get_log_filesystem(void);
 int8_t config_server_get_ap_auto_disable(void);

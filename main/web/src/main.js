@@ -3536,6 +3536,7 @@ async function postConfig() {
     obj["log_filesystem"] = document.getElementById("log_filesystem").value;
     obj["log_storage"] = document.getElementById("log_storage").value;
     obj["log_period"] = document.getElementById("log_period").value;
+    obj["log_poll_period"] = document.getElementById("log_poll_period").value;
     obj["imu_threshold"] = document.getElementById("imu_threshold").value;
     obj["elm327_udp_log"] = document.getElementById("elm327_udp_log").value;
 
@@ -4096,6 +4097,8 @@ xhttp.onload = async function() {
 
         document.getElementById('log_period').value = obj.log_period;
         document.getElementById('log_period_value').textContent = obj.log_period;
+        document.getElementById('log_poll_period').value = obj.log_poll_period;
+        document.getElementById('log_poll_period_value').textContent = obj.log_poll_period;
         
         // Load IMU threshold value and update display
         document.getElementById("imu_threshold").value = obj.imu_threshold || "8";

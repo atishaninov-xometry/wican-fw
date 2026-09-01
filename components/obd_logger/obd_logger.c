@@ -80,7 +80,8 @@ static int param_count = 0;
 static sqlite3 *db_file = NULL;
 static SemaphoreHandle_t db_mutex = NULL;
 static char db_path[128] = {0};
-static uint32_t logger_period = 0;
+static uint32_t logger_period = 0; // SD write interval, seconds
+static uint32_t poll_period = 0;   // RAM sampling interval, seconds
 static uint32_t obd_logger_params_count = 0;
 static obd_logger_get_params_cb_t obd_logger_get_params = NULL;
 static EventGroupHandle_t obd_logger_event_group = NULL;
@@ -949,7 +950,11 @@ static void obd_logger_task(void *pvParameters)
 
     obd_logger_set_initialized();
     obd_logger_enable();
-    
+
+    // Forces the first poll's baseline values (old_value starts at FLT_MAX,
+    // so every param reads as "changed") to be written immediately.
+    int64_t last_write_us = 0;
+
     while (1)
     {
         // Wait for logging to be enabled or check current state
@@ -1013,33 +1018,30 @@ static void obd_logger_task(void *pvParameters)
                     
                     if (valid_params > 0) {
 
-                        size_t changed_count = 0;
+                        // Sticky "changed since last SD write" flag: a poll tick that finds no
+                        // change must not clear a dirty flag a previous poll tick already set.
                         for (size_t i = 0; i < valid_params; i++) {
                             float diff = fabsf(param_values[i].value - param_values[i].old_value);
-                            if ( diff > 0.001f) {
+                            if (diff > 0.001f) {
                                 param_values[i].changed = true;
-                                changed_count++;
-                                ESP_LOGD(TAG, "Parameter %s changed: %.3f -> %.3f (diff: %.3f)", 
-                                        param_values[i].name, param_values[i].old_value, 
+                                ESP_LOGD(TAG, "Parameter %s changed: %.3f -> %.3f (diff: %.3f)",
+                                        param_values[i].name, param_values[i].old_value,
                                         param_values[i].value, diff);
-                            }else{
-                                param_values[i].changed = false;
-                                ESP_LOGD(TAG, "Parameter %s unchanged: %.3f (diff: %.3f)", 
-                                        param_values[i].name, param_values[i].value, diff);
                             }
                         }
 
-                        ESP_LOGI(TAG, "Storing in database changed parameters %d out of %d ", changed_count, valid_params);
-                        
-                        // Debug: Print all parameters before storing
-                        for (int i = 0; i < valid_params; i++) {
-                            ESP_LOGD(TAG, "Parameter %d: %s = %f", 
-                                     i, param_values[i].name, param_values[i].value);
-                        }
-                        
-                        esp_err_t result = obd_logger_store_params(param_values, valid_params);
-                        if (result != ESP_OK) {
-                            ESP_LOGE(TAG, "Failed to store parameters in database");
+                        uint32_t write_period_ms = (logger_period > 0) ? (logger_period * 1000) : 10000;
+                        int64_t now_us = esp_timer_get_time();
+                        if ((now_us - last_write_us) >= (int64_t)write_period_ms * 1000)
+                        {
+                            esp_err_t result = obd_logger_store_params(param_values, valid_params);
+                            if (result != ESP_OK) {
+                                ESP_LOGE(TAG, "Failed to store parameters in database");
+                            }
+                            last_write_us = now_us;
+                            for (size_t i = 0; i < valid_params; i++) {
+                                param_values[i].changed = false;
+                            }
                         }
                     } else {
                         ESP_LOGW(TAG, "No valid parameters found in JSON");
@@ -1059,9 +1061,10 @@ static void obd_logger_task(void *pvParameters)
             ESP_LOGW(TAG, "Parameter callback function is not set");
         }
         
-        // Wait for the configured period before getting parameters again
-        uint32_t delay_period = (logger_period > 0) ? (logger_period * 1000) : 10000;
-        vTaskDelay(pdMS_TO_TICKS(delay_period));
+        // Wait for the configured poll period before sampling again; the SD write
+        // itself is throttled separately above, by write_period_ms.
+        uint32_t poll_delay_ms = (poll_period > 0) ? (poll_period * 1000) : 1000;
+        vTaskDelay(pdMS_TO_TICKS(poll_delay_ms));
     }
 }
 
@@ -1083,6 +1086,7 @@ esp_err_t odb_logger_init(obd_logger_t *obd_logger)
     }
 
     logger_period = obd_logger->period_sec;
+    poll_period = obd_logger->poll_period_sec;
     obd_logger_params_count = obd_logger->obd_logger_params_count;
     if (obd_logger_params_count > MAX_PARAMS)
     {

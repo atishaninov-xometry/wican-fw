@@ -4568,7 +4568,7 @@ static void autopid_task(void *pvParameters)
     }
 }
 
-static void autopid_init_obd_logger(uint32_t log_period)
+static void autopid_init_obd_logger(uint32_t log_period, uint32_t log_poll_period)
 {
     ESP_LOGI(TAG, "Initializing Autopid OBD logger...");
 
@@ -4644,6 +4644,7 @@ static void autopid_init_obd_logger(uint32_t log_period)
         .db_filename = DB_ROOT_PATH "/" DB_DIR_NAME "/" DB_DIR_NAME,
         .obd_logger_get_params_cb = autopid_data_read};
     obd_logger.period_sec = log_period;
+    obd_logger.poll_period_sec = log_poll_period;
     obd_logger.obd_logger_params = params;
     obd_logger.obd_logger_params_count = param_count;
 
@@ -4717,7 +4718,7 @@ static void autopid_app_setbit_timer_callback(TimerHandle_t xTimer)
     dev_status_set_bits(DEV_AUTOPID_ELM327_APP_BIT);
 }
 
-void autopid_init(char *id, bool enable_logging, uint32_t logging_period)
+void autopid_init(char *id, bool enable_logging, uint32_t logging_period, uint32_t logging_poll_period)
 {
     device_id = id;
     // if(autopid_data.mutex == NULL)
@@ -4847,7 +4848,7 @@ void autopid_init(char *id, bool enable_logging, uint32_t logging_period)
     if (enable_logging && dev_status_is_bit_set(DEV_SDCARD_MOUNTED_BIT))
     {
         xSemaphoreTake(autopid_config->mutex, portMAX_DELAY);
-        autopid_init_obd_logger(logging_period);
+        autopid_init_obd_logger(logging_period, logging_poll_period);
         xSemaphoreGive(autopid_config->mutex);
     }
 

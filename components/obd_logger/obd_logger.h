@@ -28,7 +28,8 @@ typedef char* (*obd_logger_get_params_cb_t)(void);
 // structure to hold logger init parameters
 typedef struct{
     char* path;
-    uint32_t period_sec;
+    uint32_t period_sec;      // how often changed values are flushed to the SD card
+    uint32_t poll_period_sec; // how often live values are sampled into RAM
     char* db_filename;
     obd_logger_get_params_cb_t obd_logger_get_params_cb;
     obd_param_entry_t *obd_logger_params;

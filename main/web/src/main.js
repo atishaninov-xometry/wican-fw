@@ -2554,6 +2554,52 @@ function disableSubmitWithError(message, duration = 5000) {
     return false;
 }
 
+// Shared logic for the manual-entry duration fields (Poll Interval, SD Write Interval,
+// Sleep After, Wakeup Every): each is a hidden input holding the value that actually
+// gets submitted (in the field's native unit), plus a range slider and a free-text box
+// (parsed via duration_parser.js) that both write into it. unit is the native unit
+// ('ms', 's' or 'm'), used to convert to/from milliseconds for the text box and to
+// interpret a bare number typed with no suffix.
+const DURATION_UNIT_MS = { ms: 1, s: 1000, m: 60000 };
+
+function durationSetAll(fieldId, nativeValue, unit) {
+    const unitMs = DURATION_UNIT_MS[unit] || 1;
+    const hidden = document.getElementById(fieldId);
+    const slider = document.getElementById(fieldId + '_slider');
+    const label = document.getElementById(fieldId + '_value');
+    const text = document.getElementById(fieldId + '_text');
+    if (hidden) hidden.value = nativeValue;
+    if (slider) slider.value = nativeValue;
+    if (label) label.textContent = nativeValue;
+    if (text) text.value = window.formatDurationShort(Number(nativeValue) * unitMs);
+}
+
+function durationApplyMs(fieldId, ms, unit) {
+    const unitMs = DURATION_UNIT_MS[unit] || 1;
+    const hidden = document.getElementById(fieldId);
+    let native = Math.round(ms / unitMs);
+    const min = hidden.hasAttribute('data-min') ? Number(hidden.getAttribute('data-min')) : -Infinity;
+    const max = hidden.hasAttribute('data-max') ? Number(hidden.getAttribute('data-max')) : Infinity;
+    native = Math.min(Math.max(native, min), max);
+    durationSetAll(fieldId, native, unit);
+    submit_enable();
+}
+
+function durationSliderInput(fieldId, sliderValue, unit) {
+    durationApplyMs(fieldId, Number(sliderValue) * (DURATION_UNIT_MS[unit] || 1), unit);
+}
+
+function durationTextInput(fieldId, text, unit) {
+    const ms = window.parseDurationMs(text, unit);
+    if (ms == null || isNaN(ms) || ms < 0) {
+        // Unparseable: put the last-known-good value back rather than submit garbage.
+        const hidden = document.getElementById(fieldId);
+        durationSetAll(fieldId, Number(hidden.value), unit);
+        return;
+    }
+    durationApplyMs(fieldId, ms, unit);
+}
+
 function submit_enable() {
     console.log("submit_enable");
     const elements = getElements();
@@ -4095,10 +4141,8 @@ xhttp.onload = async function() {
             document.getElementById("log_storage").selectedIndex = "1";
         }
 
-        document.getElementById('log_period').value = obj.log_period;
-        document.getElementById('log_period_value').textContent = obj.log_period;
-        document.getElementById('log_poll_period').value = obj.log_poll_period;
-        document.getElementById('log_poll_period_value').textContent = obj.log_poll_period;
+        durationSetAll('log_period', obj.log_period, 's');
+        durationSetAll('log_poll_period', obj.log_poll_period, 'ms');
         
         // Load IMU threshold value and update display
         document.getElementById("imu_threshold").value = obj.imu_threshold || "8";
@@ -4123,10 +4167,8 @@ xhttp.onload = async function() {
         document.getElementById("ble_pass_value").value = obj.ble_pass;
         document.getElementById("sleep_volt").value = obj.sleep_volt;
         document.getElementById("sleep_volt_value").textContent = obj.sleep_volt;
-        document.getElementById("sleep_time").value = obj.sleep_time;
-        document.getElementById('sleep_time_value').textContent = obj.sleep_time;
-        document.getElementById("wakeup_interval").value = obj.wakeup_interval;
-        document.getElementById('wakeup_interval_value').textContent = obj.wakeup_interval;
+        durationSetAll('sleep_time', obj.sleep_time, 'm');
+        durationSetAll('wakeup_interval', obj.wakeup_interval, 'm');
         document.getElementById("batt_alert").value = "disable";
         document.getElementById("batt_alert_ssid").value = obj.batt_alert_ssid;
         document.getElementById("batt_alert_pass").value = obj.batt_alert_pass;

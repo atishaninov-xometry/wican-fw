@@ -165,6 +165,8 @@ extern const unsigned char ws_client_js_start[] asm("_binary_ws_client_js_start"
 extern const unsigned char ws_client_js_end[] asm("_binary_ws_client_js_end");
 extern const unsigned char terminal_js_start[] asm("_binary_terminal_js_start");
 extern const unsigned char terminal_js_end[] asm("_binary_terminal_js_end");
+extern const unsigned char duration_parser_js_start[] asm("_binary_duration_parser_js_start");
+extern const unsigned char duration_parser_js_end[] asm("_binary_duration_parser_js_end");
 
 typedef struct {
     const char *uri;
@@ -184,6 +186,7 @@ static const file_lookup_t file_lookup[] = {
 	{"/main.js", "application/javascript", main_js_start, main_js_end, false, NULL, NULL},
 	{"/ws_client.js", "application/javascript", ws_client_js_start, ws_client_js_end, false, NULL, NULL},
 	{"/terminal.js", "application/javascript", terminal_js_start, terminal_js_end, false, NULL, NULL},
+	{"/duration_parser.js", "application/javascript", duration_parser_js_start, duration_parser_js_end, false, NULL, NULL},
 	{"/chartjs-adapter-moment.min.js", "application/javascript", NULL, NULL, true, SD_CARD_MOUNT_POINT"/wican_data/web/chartjs-adapter-moment.min.js", "https://cdn.jsdelivr.net/npm/chartjs-adapter-moment@1.0.0/dist/chartjs-adapter-moment.min.js"},
 	{"/jquery-3.6.0.min.js", "application/javascript", NULL, NULL, true, SD_CARD_MOUNT_POINT"/wican_data/web/jquery-3.6.0.min.js", "https://code.jquery.com/jquery-3.6.0.min.js"},
 	{"/bootstrap.bundle.min.js", "application/javascript", NULL, NULL, true, SD_CARD_MOUNT_POINT"/wican_data/web/bootstrap.bundle.min.js", "https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"},
@@ -235,7 +238,7 @@ const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"we
 										\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\
 								\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"elm327_udp_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\
 										\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\",\"mqtt_security\":\"none\",\"mqtt_cert_set\": \"default\",\"mqtt_skip_cn\":\"disable\",\
-										\"logger_status\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\"log_poll_period\":\"1\"}";
+										\"logger_status\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\"log_poll_period\":\"1000\"}";
 
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"periodic_wakeup\":\"disable\",\"wakeup_interval\":\"5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
@@ -3358,15 +3361,17 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"log_poll_period");
 	if(key == 0 || key->valuestring == NULL)
 	{
-		strlcpy(device_config.log_poll_period, "1", sizeof(device_config.log_poll_period));
+		strlcpy(device_config.log_poll_period, "1000", sizeof(device_config.log_poll_period));
 	}
 	else
 	{
+		// milliseconds: 50ms floor keeps the poll task from spinning too tightly, 300000 (5min) ceiling
+		// matches the old 300s log_period range this field used to share before it was split out.
 		long log_poll_period = strtol(key->valuestring, NULL, 10);
 
-		if(log_poll_period < 1 || log_poll_period > 300)
+		if(log_poll_period < 50 || log_poll_period > 300000)
 		{
-			log_poll_period = 1;
+			log_poll_period = 1000;
 		}
 
 		snprintf(device_config.log_poll_period, sizeof(device_config.log_poll_period), "%ld", log_poll_period);
@@ -4314,7 +4319,7 @@ int8_t config_server_get_log_poll_period(uint32_t *log_poll_period)
 		return -1;
 	}
 
-	if (log_int < 1 || log_int > 300)
+	if (log_int < 50 || log_int > 300000)
 	{
 		return -1;
 	}

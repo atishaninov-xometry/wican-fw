@@ -4644,7 +4644,7 @@ static void autopid_init_obd_logger(uint32_t log_period, uint32_t log_poll_perio
         .db_filename = DB_ROOT_PATH "/" DB_DIR_NAME "/" DB_DIR_NAME,
         .obd_logger_get_params_cb = autopid_data_read};
     obd_logger.period_sec = log_period;
-    obd_logger.poll_period_sec = log_poll_period;
+    obd_logger.poll_period_ms = log_poll_period;
     obd_logger.obd_logger_params = params;
     obd_logger.obd_logger_params_count = param_count;
 

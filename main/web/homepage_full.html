@@ -170,6 +170,16 @@
             width: 100%;
         }
 
+        .slider-container input[type="range"] {
+            flex: 1 1 auto;
+            width: auto;
+        }
+
+        .slider-container .duration-text {
+            flex: 0 0 auto;
+            width: 90px;
+        }
+
         input[type="text"],
         input[type="file"],
         input[type="number"] {
@@ -1763,15 +1773,19 @@
                 <tr>
                     <td>Sleep After:</td>
                     <td class="slider-container">
-                        <input type="range" 
-                               id="sleep_time" 
-                               name="sleep_time" 
-                               value="5" 
-                               min="1" 
-                               max="30" 
+                        <input type="hidden" id="sleep_time" name="sleep_time" value="5" data-min="1" data-max="30">
+                        <input type="range"
+                               id="sleep_time_slider"
+                               value="5"
+                               min="1"
+                               max="30"
                                step="1"
-                               oninput="document.getElementById('sleep_time_value').textContent = this.value;submit_enable();">
+                               oninput="durationSliderInput('sleep_time', this.value, 'm');">
                         <span id="sleep_time_value">5</span>min
+                        <input type="text" class="duration-text" id="sleep_time_text" value="5m"
+                               placeholder="e.g. 5m, 1h"
+                               title="Type an exact value: 5m, 1h, 1h 30m, ..."
+                               onchange="durationTextInput('sleep_time', this.value, 'm');">
                     </td>
                 </tr>
                 <tr>
@@ -1786,15 +1800,19 @@
                 <tr id="wakeup_every_row">
                     <td>Wakeup Every:</td>
                     <td class="slider-container">
-                        <input type="range" 
-                               id="wakeup_interval" 
-                               name="wakeup_interval" 
-                               value="60" 
-                               min="5" 
-                               max="1440" 
+                        <input type="hidden" id="wakeup_interval" name="wakeup_interval" value="60" data-min="5" data-max="1440">
+                        <input type="range"
+                               id="wakeup_interval_slider"
+                               value="60"
+                               min="5"
+                               max="1440"
                                step="1"
-                               oninput="document.getElementById('wakeup_interval_value').textContent = this.value;submit_enable();">
+                               oninput="durationSliderInput('wakeup_interval', this.value, 'm');">
                         <span id="wakeup_interval_value">60</span>min
+                        <input type="text" class="duration-text" id="wakeup_interval_text" value="1h"
+                               placeholder="e.g. 60m, 2h"
+                               title="Type an exact value: 60m, 2h, 1d, ..."
+                               onchange="durationTextInput('wakeup_interval', this.value, 'm');">
                     </td>
                 </tr>
                 <tr>
@@ -1900,30 +1918,38 @@
                 <tr>
                     <td>Poll Interval:</td>
                     <td class="slider-container">
+                        <input type="hidden" id="log_poll_period" name="log_poll_period" value="1000" data-min="50" data-max="300000">
                         <input type="range"
-                            id="log_poll_period"
-                            name="log_poll_period"
-                            value="1"
-                            min="1"
-                            max="300"
-                            step="1"
-                            oninput="document.getElementById('log_poll_period_value').textContent = this.value;submit_enable();">
-                        <span id="log_poll_period_value">1</span>sec
+                            id="log_poll_period_slider"
+                            value="1000"
+                            min="50"
+                            max="10000"
+                            step="50"
+                            oninput="durationSliderInput('log_poll_period', this.value, 'ms');">
+                        <span id="log_poll_period_value">1000</span>ms
+                        <input type="text" class="duration-text" id="log_poll_period_text" value="1s"
+                            placeholder="e.g. 500ms, 2s"
+                            title="Type an exact value: 500ms, 2s, 1.5s, ..."
+                            onchange="durationTextInput('log_poll_period', this.value, 'ms');">
                         &nbsp;(how often live values are sampled into RAM; free, no SD wear)
                     </td>
                 </tr>
                 <tr>
                     <td>SD Write Interval:</td>
                     <td class="slider-container">
+                        <input type="hidden" id="log_period" name="log_period" value="10" data-min="1" data-max="300">
                         <input type="range"
-                            id="log_period"
-                            name="log_period"
+                            id="log_period_slider"
                             value="10"
                             min="1"
                             max="300"
                             step="1"
-                            oninput="document.getElementById('log_period_value').textContent = this.value;submit_enable();">
+                            oninput="durationSliderInput('log_period', this.value, 's');">
                         <span id="log_period_value">10</span>sec
+                        <input type="text" class="duration-text" id="log_period_text" value="10s"
+                            placeholder="e.g. 30s, 2m"
+                            title="Type an exact value: 30s, 2m, 1m 30s, ..."
+                            onchange="durationTextInput('log_period', this.value, 's');">
                         &nbsp;(how often sampled values are flushed to the SD card)
                     </td>
                 </tr>
@@ -2363,6 +2389,7 @@
     </div>
     <script src="/ws_client.js"></script>
     <script src="/terminal.js"></script>
+    <script src="/duration_parser.js"></script>
     <script src="/main.js"></script>
     <script src="/lucide_icons.js"></script>
 </body>

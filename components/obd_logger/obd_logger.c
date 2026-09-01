@@ -81,7 +81,7 @@ static sqlite3 *db_file = NULL;
 static SemaphoreHandle_t db_mutex = NULL;
 static char db_path[128] = {0};
 static uint32_t logger_period = 0; // SD write interval, seconds
-static uint32_t poll_period = 0;   // RAM sampling interval, seconds
+static uint32_t poll_period = 0;   // RAM sampling interval, milliseconds
 static uint32_t obd_logger_params_count = 0;
 static obd_logger_get_params_cb_t obd_logger_get_params = NULL;
 static EventGroupHandle_t obd_logger_event_group = NULL;
@@ -1061,9 +1061,9 @@ static void obd_logger_task(void *pvParameters)
             ESP_LOGW(TAG, "Parameter callback function is not set");
         }
         
-        // Wait for the configured poll period before sampling again; the SD write
-        // itself is throttled separately above, by write_period_ms.
-        uint32_t poll_delay_ms = (poll_period > 0) ? (poll_period * 1000) : 1000;
+        // Wait for the configured poll period (already milliseconds) before sampling
+        // again; the SD write itself is throttled separately above, by write_period_ms.
+        uint32_t poll_delay_ms = (poll_period > 0) ? poll_period : 1000;
         vTaskDelay(pdMS_TO_TICKS(poll_delay_ms));
     }
 }
@@ -1086,7 +1086,7 @@ esp_err_t odb_logger_init(obd_logger_t *obd_logger)
     }
 
     logger_period = obd_logger->period_sec;
-    poll_period = obd_logger->poll_period_sec;
+    poll_period = obd_logger->poll_period_ms;
     obd_logger_params_count = obd_logger->obd_logger_params_count;
     if (obd_logger_params_count > MAX_PARAMS)
     {

@@ -1,0 +1,67 @@
+name: Build firmware (WiCAN Pro, IDF 6)
+
+on:
+  push:
+    branches:
+      - 'sd-logging-patches-**'
+    paths-ignore:
+      - '**.md'
+      - 'imports/**'
+      - '.github/workflows/deploy-docs.yml'
+  workflow_dispatch:
+    inputs:
+      idf_version:
+        description: 'ESP-IDF version (docker image tag, e.g. v6.0.2 or v5.3.3)'
+        required: false
+        default: 'v6.0.2'
+
+permissions:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+
+      - name: Regenerate dependency lock for this IDF
+        # committed lock has hashes from an older component manager; IDF 6 rejects them
+        run: rm -f dependencies.lock
+
+      - name: ESP-IDF build (target esp32s3)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ github.event.inputs.idf_version || 'v6.0.2' }}
+          target: esp32s3
+          command: idf.py build
+
+      - name: Stage flashable artifacts
+        run: |
+          set -eu
+          mkdir -p artifacts
+          cp build/*.bin artifacts/ 2>/dev/null || true
+          cp build/bootloader/bootloader.bin artifacts/
+          cp build/partition_table/partition-table.bin artifacts/
+          cp build/flasher_args.json artifacts/
+          ls -la artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: wican-fw-obd-pro-${{ github.ref_name }}-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: build-${{ github.run_number }}-${{ github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: "WiCAN Pro firmware — ${{ github.ref_name }} (build ${{ github.run_number }})"
+          body_path: artifacts/BUILD_INFO.txt
+          files: artifacts/*
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true

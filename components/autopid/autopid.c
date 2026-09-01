@@ -3062,6 +3062,21 @@ static bool autopid_validate_response_for_cmd(const char *cmd_str, const respons
     //  22 B0 02 -> 62 B0 02 ...
     uint8_t pos_service = (uint8_t)(service + 0x40);
 
+    // A batched Mode-01 request ("01" + 2+ single-byte PIDs, e.g. "010C0D11") is not
+    // one contiguous identifier like Mode 22's - the response is 41 PID1 data... PID2
+    // data..., so the requested bytes never appear back-to-back like they do below.
+    // autopid_poll_std_pids_batched() already re-validates each PID by walking the
+    // payload with resync-loss detection; here just confirm a real positive response.
+    if (service == 0x01 && req_len > 2)
+    {
+        for (uint32_t i = 0; i < rsp->length; i++)
+        {
+            if (rsp->data[i] == pos_service)
+                return true;
+        }
+        return false;
+    }
+
     // Build expected sequence: [pos_service] + remaining request bytes (pid/identifier)
     uint8_t expected[4] = {0};
     size_t expected_len = 1;

@@ -60,6 +60,13 @@
 #define TEMP_BUFFER_LENGTH 32
 #define ECU_CONNECTED_BIT BIT0
 #define AUTOPID_POLL_JITTER_MS 100
+// Yield between sequential PID requests. Was a hard-coded 100ms; dropped to
+// 5ms to shrink the poll-cycle time (the cycle caps effective per-PID rate).
+#define AUTOPID_INTER_REQUEST_GAP_MS 5
+
+// Max PIDs per batched Mode-01 request for Standard PIDs (see MIATA_ND3_NOTES.md).
+#define AUTOPID_STD_BATCH_MAX 6
+#define AUTOPID_STD_APPLY_MAX (AUTOPID_STD_BATCH_MAX * 4)
 
 // Backoff tuning (milliseconds)
 // How many consecutive failures before enabling backoff.
@@ -335,6 +342,332 @@ static esp_err_t extract_signal_value(const uint8_t *data,
 
     *result = physical_value;
     return ESP_OK;
+}
+
+// Forward decls: defined later in this file, needed by the batched std-PID
+// poller below.
+static void send_commands(char *commands, uint32_t delay_ms);
+static void publish_parameter_mqtt(parameter_t *param);
+static void autopid_data_update(autopid_config_t *pids);
+
+// Reassemble a classic (8-byte, non-FD) ISO-TP payload. response->data is
+// already the per-line bytes with PCI markers still in place, one physical
+// CAN frame per 8-byte chunk. Returns the payload length, or 0 on any framing
+// problem.
+static uint32_t autopid_isotp_reassemble(const uint8_t *raw, uint32_t raw_len, uint8_t *out, uint32_t out_cap)
+{
+    if (raw == NULL || out == NULL || raw_len < 1)
+    {
+        return 0;
+    }
+
+    uint8_t pci_type = raw[0] >> 4;
+
+    if (pci_type == 0x0)
+    {
+        // Single Frame: 0L DD DD ...
+        uint32_t sf_len = raw[0] & 0x0F;
+        if (sf_len == 0 || sf_len > out_cap || (1 + sf_len) > raw_len)
+        {
+            return 0;
+        }
+        memcpy(out, &raw[1], sf_len);
+        return sf_len;
+    }
+
+    if (pci_type == 0x1)
+    {
+        // First Frame: 1L LL DD DD DD DD DD DD (6 data bytes here), followed by
+        // Consecutive Frames: 2N DD DD DD DD DD DD DD (7 data bytes each).
+        if (raw_len < 8)
+        {
+            return 0;
+        }
+        uint32_t total_len = ((uint32_t)(raw[0] & 0x0F) << 8) | raw[1];
+        if (total_len == 0 || total_len > out_cap)
+        {
+            return 0;
+        }
+
+        uint32_t copied = (total_len < 6) ? total_len : 6;
+        memcpy(out, &raw[2], copied);
+
+        uint32_t pos = 8; // start of the next physical 8-byte frame
+        uint8_t expected_seq = 1;
+        while (copied < total_len)
+        {
+            if (pos + 8 > raw_len)
+            {
+                return 0; // truncated - missing consecutive frame(s)
+            }
+            uint8_t cf_type = raw[pos] >> 4;
+            uint8_t cf_seq = raw[pos] & 0x0F;
+            if (cf_type != 0x2 || cf_seq != expected_seq)
+            {
+                return 0; // out-of-sequence / malformed - don't guess
+            }
+            uint32_t remaining = total_len - copied;
+            uint32_t take = (remaining < 7) ? remaining : 7;
+            memcpy(out + copied, &raw[pos + 1], take);
+            copied += take;
+            pos += 8;
+            expected_seq = (expected_seq + 1) & 0x0F;
+        }
+        return copied;
+    }
+
+    return 0; // flow-control or unknown PCI type - not a data response
+}
+
+// Data-byte length of a standard PID's response, from its full param table
+// (not just the params currently enabled).
+static uint8_t autopid_std_pid_data_len(uint8_t pid_num)
+{
+    const std_pid_t *pid_info = get_pid(pid_num);
+    if (!pid_info || pid_info->num_params == 0)
+    {
+        return 0;
+    }
+
+    uint8_t max_end = 0;
+    for (int i = 0; i < pid_info->num_params; i++)
+    {
+        uint8_t start_byte = pid_info->params[i].bit_start / 8;
+        uint8_t bytes_needed = (pid_info->params[i].bit_length + 7) / 8;
+        uint8_t end = start_byte + bytes_needed; // absolute index in a [PCI][41][PID][A][B]... buffer
+        if (end > max_end)
+        {
+            max_end = end;
+        }
+    }
+    return (max_end >= 3) ? (max_end - 3) : 0;
+}
+
+// Poll every due Standard PID in one batched Mode-01 request instead of one
+// request per PID. Re-arms the timer for every PID it services, so the
+// per-PID loop below just finds it not due and skips it.
+static void autopid_poll_std_pids_batched(pid_type_t *previous_pid_type)
+{
+    if (!autopid_config->pid_std_en)
+    {
+        return;
+    }
+
+    uint8_t batch_pids[AUTOPID_STD_BATCH_MAX];
+    uint32_t batch_count = 0;
+
+    struct
+    {
+        parameter_t *param;
+        uint8_t pid_num;
+    } apply_list[AUTOPID_STD_APPLY_MAX];
+    uint32_t apply_count = 0;
+
+    char cmd[2 + (AUTOPID_STD_BATCH_MAX * 2) + 2]; // "01" + up to 6 PID hex pairs + '\r' + '\0'
+    cmd[0] = '0';
+    cmd[1] = '1';
+    uint32_t cmd_len = 2;
+
+    for (uint32_t i = 0; i < autopid_config->pid_count; i++)
+    {
+        pid_data_t *curr_pid = &autopid_config->pids[i];
+        if (curr_pid->pid_type != PID_STD || !curr_pid->enabled || curr_pid->parameters_count == 0)
+        {
+            continue;
+        }
+        parameter_t *param = &curr_pid->parameters[0];
+        if (!param->enabled || !wc_timer_is_expired(&param->timer))
+        {
+            continue;
+        }
+        if (curr_pid->cmd == NULL || strlen(curr_pid->cmd) < 4)
+        {
+            continue;
+        }
+
+        char pid_hex[3] = { curr_pid->cmd[2], curr_pid->cmd[3], '\0' };
+        uint8_t pid_num = (uint8_t)strtol(pid_hex, NULL, 16);
+
+        bool already_in_batch = false;
+        for (uint32_t b = 0; b < batch_count; b++)
+        {
+            if (batch_pids[b] == pid_num)
+            {
+                already_in_batch = true;
+                break;
+            }
+        }
+
+        if (!already_in_batch)
+        {
+            if (batch_count >= AUTOPID_STD_BATCH_MAX)
+            {
+                continue; // doesn't fit this round; stays due, picked up next pass
+            }
+            batch_pids[batch_count++] = pid_num;
+            cmd[cmd_len++] = pid_hex[0];
+            cmd[cmd_len++] = pid_hex[1];
+        }
+
+        // May be a second param sharing an already-batched PID.
+        if (apply_count < AUTOPID_STD_APPLY_MAX)
+        {
+            apply_list[apply_count].param = param;
+            apply_list[apply_count].pid_num = pid_num;
+            apply_count++;
+        }
+
+        wc_timer_set(&param->timer, param->period);
+        param->timer += ((int64_t)(esp_random() % ((AUTOPID_POLL_JITTER_MS * 2) + 1)) - AUTOPID_POLL_JITTER_MS) * 1000;
+    }
+
+    if (batch_count == 0)
+    {
+        return;
+    }
+    cmd[cmd_len++] = '\r';
+    cmd[cmd_len] = '\0';
+
+    if (autopid_config->standard_init && strlen(autopid_config->standard_init) > 0)
+    {
+        ESP_LOGI(TAG, "Sending standard init: %s", autopid_config->standard_init);
+        send_commands(autopid_config->standard_init, 2);
+    }
+    *previous_pid_type = PID_STD;
+
+    ESP_LOGI(TAG, "Executing batched std PID command: %s (%lu PIDs)", cmd, (unsigned long)batch_count);
+
+    // Per-PID slice of the reassembled payload, filled in while walking it below.
+    uint8_t payload[64] = {0};
+    uint32_t payload_len = 0;
+    uint32_t pid_offset[AUTOPID_STD_BATCH_MAX] = {0};
+    uint8_t pid_len[AUTOPID_STD_BATCH_MAX] = {0};
+    bool pid_ok[AUTOPID_STD_BATCH_MAX] = {false};
+    bool batch_ok = false;
+
+    if (elm327_process_cmd((uint8_t *)cmd, cmd_len, &autopidQueue, elm327_autopid_cmd_buffer, &elm327_autopid_cmd_buffer_len, &elm327_autopid_last_cmd_time, autopid_parser) == ESP_OK)
+    {
+        response_t elm327_response;
+        memset(&elm327_response, 0, sizeof(elm327_response));
+
+        if (xQueueReceive(autopidQueue, &elm327_response, pdMS_TO_TICKS(12000)) == pdPASS)
+        {
+            if (strstr((char *)elm327_response.data, "error") == NULL &&
+                strstr((char *)elm327_response.data, "SEARCHING") == NULL &&
+                strstr((char *)elm327_response.data, "UNABLE TO CONNECT") == NULL)
+            {
+                payload_len = autopid_isotp_reassemble(elm327_response.data, elm327_response.length, payload, sizeof(payload));
+
+                if (payload_len >= 1 && payload[0] == 0x41)
+                {
+                    xEventGroupSetBits(xautopid_event_group, ECU_CONNECTED_BIT);
+                    uint32_t cursor = 1;
+                    batch_ok = true;
+                    for (uint32_t b = 0; b < batch_count; b++)
+                    {
+                        if (cursor >= payload_len || payload[cursor] != batch_pids[b])
+                        {
+                            ESP_LOGW(TAG, "Batch resync lost at PID %u (offset %lu) - stopping decode, keeping earlier PIDs", (unsigned)batch_pids[b], (unsigned long)cursor);
+                            break; // can't trust anything from here on; earlier PIDs (pid_ok already set) stand
+                        }
+                        uint8_t dlen = autopid_std_pid_data_len(batch_pids[b]);
+                        if (cursor + 1 + dlen > payload_len)
+                        {
+                            ESP_LOGW(TAG, "Batch response truncated for PID %u", (unsigned)batch_pids[b]);
+                            break;
+                        }
+                        pid_offset[b] = cursor + 1;
+                        pid_len[b] = dlen;
+                        pid_ok[b] = true;
+                        cursor += 1 + dlen;
+                    }
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "Batched std PID response failed ISO-TP reassembly (raw len %lu)", (unsigned long)elm327_response.length);
+                }
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Batched std PID command got an error/no-data response");
+            }
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Batched std PID queue receive timed out");
+        }
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to send batched std PID command: %s", cmd);
+    }
+
+    for (uint32_t a = 0; a < apply_count; a++)
+    {
+        parameter_t *param = apply_list[a].param;
+        int32_t b = -1;
+        for (uint32_t bb = 0; bb < batch_count; bb++)
+        {
+            if (batch_pids[bb] == apply_list[a].pid_num)
+            {
+                b = (int32_t)bb;
+                break;
+            }
+        }
+
+        if (!batch_ok || b < 0 || !pid_ok[b])
+        {
+            param->failed = true;
+            continue;
+        }
+
+        uint8_t synth[3 + 8];
+        if (pid_len[b] > sizeof(synth) - 3)
+        {
+            param->failed = true;
+            continue;
+        }
+        synth[0] = 0x00;
+        synth[1] = 0x41;
+        synth[2] = apply_list[a].pid_num;
+        memcpy(&synth[3], &payload[pid_offset[b]], pid_len[b]);
+
+        const std_pid_t *pid_info = get_pid_from_string(param->name);
+        const char *param_name = param->name ? strchr(param->name, '-') : NULL;
+        bool matched = false;
+
+        if (pid_info && param_name)
+        {
+            for (int pi = 0; pi < pid_info->num_params; pi++)
+            {
+                if (strcmp(pid_info->params[pi].name, param_name + 1) == 0)
+                {
+                    float value = 0.0f;
+                    if (extract_signal_value(synth, (uint8_t)(3 + pid_len[b]), &pid_info->params[pi], &value) == ESP_OK)
+                    {
+                        matched = true;
+                        param->failed = false;
+                        if (autopid_prepare_parameter_value(param, value, &param->value, "STD"))
+                        {
+                            ESP_LOGI(TAG, "Parameter %s (batched) result: %.2f %s",
+                                     param->name, param->value, pid_info->params[pi].unit);
+                            autopid_config->last_successful_pid_time = time(NULL);
+                            publish_parameter_mqtt(param);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (!matched)
+        {
+            param->failed = true;
+            ESP_LOGW(TAG, "Batched std PID: failed to extract %s", param->name ? param->name : "(null)");
+        }
+    }
+
+    autopid_data_update(autopid_config);
 }
 
 static void merge_response_frames(uint8_t *data, uint32_t length, uint8_t *merged_frame)
@@ -3872,6 +4205,12 @@ static void autopid_task(void *pvParameters)
         {
             xSemaphoreTake(autopid_config->mutex, portMAX_DELAY);
 
+            // Batch due Standard PIDs before the per-PID loop below.
+            if (!dev_status_is_sleeping())
+            {
+                autopid_poll_std_pids_batched(&previous_pid_type);
+            }
+
             // Loop through all PIDs
             for (uint32_t i = 0; i < autopid_config->pid_count; i++)
             {
@@ -4089,10 +4428,10 @@ static void autopid_task(void *pvParameters)
                         }
                         // Update pid data
                         autopid_data_update(autopid_config);
-                        // pause 100ms between pid requests
+                        // pause between pid requests (was 100ms)
                         xSemaphoreGive(autopid_config->mutex);
                         dev_status_wait_for_bits(DEV_AUTOPID_ELM327_APP_BIT, portMAX_DELAY);
-                        vTaskDelay(pdMS_TO_TICKS(100));
+                        vTaskDelay(pdMS_TO_TICKS(AUTOPID_INTER_REQUEST_GAP_MS));
                         xSemaphoreTake(autopid_config->mutex, portMAX_DELAY);
                     }
                     else

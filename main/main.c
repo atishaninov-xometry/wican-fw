@@ -65,6 +65,7 @@
 #include "usb_host.h"
 #include "wc_mdns.h"
 #include "sdcard.h"
+#include "obd_logger.h"
 #include "imu.h"
 #include "rtcm.h"
 #include "cmdline.h"
@@ -570,6 +571,62 @@ void safe_mode_check(void)
 		vTaskDelay(pdMS_TO_TICKS(100));
 	}
 }
+
+#if HARDWARE_VER == WICAN_PRO
+/* Runtime "safe eject" for the SD card: hold the button ~3s while running to
+ * flush/close the SQLite log DB and unmount FATFS (logger runs
+ * synchronous=OFF, so nothing is durable until checkpoint/unmount).
+ * Boot-time button functions (safe mode / SD-OTA) are checked before this
+ * task starts, so they're unaffected. */
+static void sdcard_eject_button_task(void *arg)
+{
+    const int HOLD_MS = 3000;
+    const int POLL_MS = 50;
+    bool ejected = false;
+    for (;;)
+    {
+        if (gpio_get_level(BUTTON_GPIO_NUM) == 0)   /* active-low (pull-up) */
+        {
+            int held = 0;
+            while (gpio_get_level(BUTTON_GPIO_NUM) == 0 && held < HOLD_MS)
+            {
+                vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+                held += POLL_MS;
+            }
+            if (held >= HOLD_MS)
+            {
+                if (!ejected && sdcard_is_mounted())
+                {
+                    ESP_LOGW("SDEJECT", "Button held: preparing SD card for ejection...");
+                    led_set_level(255, 255, 0);            /* yellow = flushing/working (blue is the idle color) */
+                    if (obd_logger_is_initialized())
+                    {
+                        obd_logger_disable();              /* stop the logger writing */
+                        vTaskDelay(pdMS_TO_TICKS(300));    /* let any in-flight write finish */
+                        obd_logger_lock_close();           /* checkpoint WAL + sqlite3_close -> flush to .db, hold lock */
+                    }
+                    esp_err_t ret = sd_card_deinit();      /* unmount FATFS -> flush cache */
+                    if (ret == ESP_OK)
+                    {
+                        ESP_LOGW("SDEJECT", "SD safely unmounted - OK to remove the card.");
+                        led_set_level(0, 255, 0);          /* solid GREEN = safe to eject */
+                        ejected = true;                    /* remount requires a reboot */
+                    }
+                    else
+                    {
+                        ESP_LOGE("SDEJECT", "Unmount failed: %s", esp_err_to_name(ret));
+                        led_set_level(255, 0, 0);          /* red = error */
+                    }
+                }
+                /* wait for release so we don't retrigger */
+                while (gpio_get_level(BUTTON_GPIO_NUM) == 0)
+                    vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+    }
+}
+#endif
 
 void app_main(void)
 {
@@ -1165,6 +1222,9 @@ void app_main(void)
     gpio_set_level(PWR_LED_GPIO_NUM, 1);
 	#elif HARDWARE_VER == WICAN_PRO
 	led_set_level(0,0,200);
+
+	// watch the button for a runtime "safe eject" of the SD card
+	xTaskCreate(sdcard_eject_button_task, "sd_eject", 8192, NULL, 3, NULL);
 
 	if(gpio_get_level(USB_ID_PIN) == 0)
 	{

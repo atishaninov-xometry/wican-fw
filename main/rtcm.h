@@ -19,4 +19,8 @@ time_t rtcm_bcd_to_unix_timestamp(uint8_t hour, uint8_t min, uint8_t sec,
 uint8_t year, uint8_t month, uint8_t day);
 time_t rtcm_get_unix_timestamp(void);
 esp_err_t rtcm_sync_system_time_from_rtc(void);
+/* Manually set the hardware RTC (and the ESP32 system clock) from a UNIX epoch
+ * (UTC seconds). Used by the web UI "Set time" / "Borrow browser time" feature
+ * so the clock works without NTP/internet. */
+esp_err_t rtcm_set_from_unix(time_t epoch);
 #endif /* _RTCM_H_ */

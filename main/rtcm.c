@@ -498,6 +498,51 @@ esp_err_t rtcm_sync_system_time_from_rtc(void)
     return ESP_OK;
 }
 
+esp_err_t rtcm_set_from_unix(time_t epoch)
+{
+    /* Sanity: reject obviously-wrong values (before ~2023-11-14). */
+    if (epoch < 1700000000)
+    {
+        ESP_LOGE(TAG, "rtcm_set_from_unix: implausible epoch %lld", (long long)epoch);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 1) Set the ESP32 system clock immediately (system time is UTC epoch). */
+    struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+    if (settimeofday(&tv, NULL) != 0)
+    {
+        ESP_LOGW(TAG, "rtcm_set_from_unix: settimeofday failed");
+    }
+
+    /* 2) Persist to the RX8130 hardware RTC as BCD. We store *local* wall-clock
+     *    (localtime_r) so it round-trips exactly through rtcm_sync_system_time_from_rtc(),
+     *    which reconstructs the epoch with mktime() (local interpretation) on boot. */
+    struct tm t;
+    localtime_r(&epoch, &t);
+
+    #define RTCM_DEC2BCD(x) ((uint8_t)((((x) / 10) << 4) | ((x) % 10)))
+    uint8_t weekday = (t.tm_wday == 0) ? 7 : (uint8_t)t.tm_wday;   /* 1..7 */
+    esp_err_t ret = rtcm_set_date(RTCM_DEC2BCD(t.tm_year - 100), RTCM_DEC2BCD(t.tm_mon + 1),
+                                  RTCM_DEC2BCD(t.tm_mday), RTCM_DEC2BCD(weekday));
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "rtcm_set_from_unix: rtcm_set_date failed");
+        return ret;
+    }
+    ret = rtcm_set_time(RTCM_DEC2BCD(t.tm_hour), RTCM_DEC2BCD(t.tm_min), RTCM_DEC2BCD(t.tm_sec));
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "rtcm_set_from_unix: rtcm_set_time failed");
+        return ret;
+    }
+    #undef RTCM_DEC2BCD
+
+    ESP_LOGI(TAG, "RTC manually set to %04d-%02d-%02d %02d:%02d:%02d (epoch %lld)",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
+             (long long)epoch);
+    return ESP_OK;
+}
+
 esp_err_t rtcm_init(i2c_port_t i2c_num)
 {
     esp_err_t ret;

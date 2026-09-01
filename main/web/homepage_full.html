@@ -689,6 +689,10 @@
             <span data-lucide="file-text" style="width: 18px; height: 18px; margin-right: 8px;"></span>
             <b>Logger Settings</b>
         </button>
+        <button class="tablinks" onclick="openTab(event, 'time_tab')">
+            <span data-lucide="clock" style="width: 18px; height: 18px; margin-right: 8px;"></span>
+            <b>Time</b>
+        </button>
         <button class="tablinks" onclick="openTab(event, 'dashboard_tab')">
             <span data-lucide="bar-chart-3" style="width: 18px; height: 18px; margin-right: 8px;"></span>
             <b>Dashboard</b>
@@ -1787,7 +1791,7 @@
                                name="wakeup_interval" 
                                value="60" 
                                min="5" 
-                               max="240" 
+                               max="1440" 
                                step="1"
                                oninput="document.getElementById('wakeup_interval_value').textContent = this.value;submit_enable();">
                         <span id="wakeup_interval_value">60</span>min
@@ -1896,18 +1900,138 @@
                 <tr>
                     <td>Log Period:</td>
                     <td class="slider-container">
-                        <input type="range" 
-                            id="log_period" 
-                            name="log_period" 
-                            value="60" 
-                            min="10" 
-                            max="300" 
+                        <input type="range"
+                            id="log_period"
+                            name="log_period"
+                            value="10"
+                            min="1"
+                            max="300"
                             step="1"
                             oninput="document.getElementById('log_period_value').textContent = this.value;submit_enable();">
-                        <span id="log_period_value">60</span>sec
+                        <span id="log_period_value">10</span>sec
+                        &nbsp;(1&nbsp;=&nbsp;1&nbsp;Hz)
                     </td>
                 </tr>
             </table>
+        </div>
+        <div id="time_tab" class="tabcontent">
+            <div class="section-title">Time / Clock</div>
+            <table class="form-table">
+                <tr>
+                    <td>Device time (UTC):</td>
+                    <td><span id="device_time_display">&mdash;</span>
+                        <button type="button" onclick="refreshDeviceTime()" style="margin-left:8px;">Refresh</button>
+                    </td>
+                </tr>
+                <tr>
+                    <td>New time (staged):</td>
+                    <td>
+                        <input type="datetime-local" id="manual_time_input" step="1">
+                        <button type="button" onclick="borrowBrowserTime()" style="margin-left:8px;">Borrow browser time</button>
+                    </td>
+                </tr>
+                <tr>
+                    <td></td>
+                    <td>
+                        <button type="button" id="commit_time_btn" onclick="commitTime()"
+                            style="background:var(--primary-color);color:#fff;padding:0.5rem 1rem;border:none;border-radius:6px;cursor:pointer;">
+                            <b>Commit time to RTC</b>
+                        </button>
+                    </td>
+                </tr>
+                <tr>
+                    <td>Internet sync:</td>
+                    <td>
+                        <button type="button" id="sync_internet_btn" onclick="syncInternetTime()"
+                            style="background:var(--success-color);color:#fff;padding:0.5rem 1rem;border:none;border-radius:6px;cursor:pointer;">
+                            <b>Sync from internet (NTP-like)</b>
+                        </button>
+                    </td>
+                </tr>
+                <tr>
+                    <td></td>
+                    <td><span id="time_set_status" style="font-size:0.9rem;"></span></td>
+                </tr>
+            </table>
+            <p style="margin:1rem;color:var(--gray-600);font-size:0.9rem;">
+                Two ways to set the clock. <b>Manual:</b> <b>Borrow browser time</b> stages this phone's current
+                clock into the field (edit if you like), then <b>Commit time to RTC</b> writes it &ndash; nothing is
+                written until you commit. <b>Internet sync:</b> <b>Sync from internet (NTP-like)</b> fetches
+                authoritative UTC from a public time API <i>through your phone's connection</i> (the WiCAN itself
+                never goes online &ndash; same trick as the firmware-update check) and writes it in one shot; it
+                needs your phone to have internet. Both store UTC epoch (matches the logger's timestamps).
+            </p>
+            <script>
+                function _timeStatus(msg, ok){
+                    var el=document.getElementById('time_set_status');
+                    if(el){ el.textContent=msg; el.style.color = ok ? 'var(--success-color)' : 'var(--danger-color)'; }
+                }
+                function _pad2(n){ return String(n).padStart(2,'0'); }
+                function refreshDeviceTime(){
+                    fetch('/get_time').then(function(r){return r.json();}).then(function(d){
+                        var el=document.getElementById('device_time_display');
+                        if(el){ el.textContent = new Date(d.epoch*1000).toISOString().replace('T',' ').replace('.000Z',' UTC'); }
+                    }).catch(function(){ var el=document.getElementById('device_time_display'); if(el) el.textContent='(unavailable)'; });
+                }
+                // Stages the browser's current time into the field; does not write it.
+                function borrowBrowserTime(){
+                    var d=new Date();
+                    var v=d.getFullYear()+'-'+_pad2(d.getMonth()+1)+'-'+_pad2(d.getDate())+'T'+
+                          _pad2(d.getHours())+':'+_pad2(d.getMinutes())+':'+_pad2(d.getSeconds());
+                    document.getElementById('manual_time_input').value=v;
+                    _timeStatus('Staged '+v+' from browser — press Commit to write it.', true);
+                }
+                // Posts the staged/edited field value to the RTC.
+                function commitTime(){
+                    var v=document.getElementById('manual_time_input').value;
+                    if(!v){ _timeStatus('Borrow browser time or enter a date/time first.', false); return; }
+                    var epoch = Math.floor(new Date(v).getTime()/1000);
+                    if(isNaN(epoch)){ _timeStatus('Invalid date/time.', false); return; }
+                    fetch('/set_time', {method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify({epoch: epoch})})
+                        .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+                        .then(function(){ _timeStatus('Committed '+v+' to RTC.', true); refreshDeviceTime(); })
+                        .catch(function(e){ _timeStatus('Failed: '+e.message, false); });
+                }
+                // The WiCAN has no internet, so the browser fetches UTC over the phone's
+                // connection and posts it to /set_time. Falls back across sources.
+                function syncInternetTime(){
+                    _timeStatus('Fetching precise time from the internet (via your phone)…', true);
+                    var sources=[
+                      {name:'timeapi.io', url:'https://timeapi.io/api/time/current/zone?timeZone=Etc/UTC',
+                       parse:function(d){ if(!d||d.year==null) return null;
+                         var e=Math.floor(Date.UTC(d.year,(d.month||1)-1,d.day,d.hour,d.minute,d.seconds)/1000);
+                         return isNaN(e)?null:e; }},
+                      {name:'worldtimeapi.org', url:'https://worldtimeapi.org/api/timezone/Etc/UTC',
+                       parse:function(d){ return (d && d.unixtime) ? d.unixtime : null; }}
+                    ];
+                    function setRtc(epoch, name){
+                        return fetch('/set_time',{method:'POST',headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify({epoch:epoch})})
+                            .then(function(r){ if(!r.ok) throw new Error('RTC set HTTP '+r.status); return r.json(); })
+                            .then(function(){
+                                var iso=new Date(epoch*1000).toISOString().replace('T',' ').replace('.000Z',' UTC');
+                                _timeStatus('Synced RTC to '+iso+' (source: '+name+').', true);
+                                refreshDeviceTime();
+                            });
+                    }
+                    function attempt(i){
+                        if(i>=sources.length){
+                            _timeStatus('Could not reach an internet time source (needs your phone online; some servers block cross-origin requests). Use "Borrow browser time" instead.', false);
+                            return;
+                        }
+                        var s=sources[i];
+                        fetch(s.url).then(function(r){ if(!r.ok) throw 0; return r.json(); })
+                            .then(function(d){ var epoch=s.parse(d); if(!epoch) throw 0;
+                                return setRtc(epoch, s.name).catch(function(e){
+                                    _timeStatus('Got time from '+s.name+' but failed to set the RTC: '+e.message, false);
+                                });
+                            })
+                            .catch(function(){ attempt(i+1); });
+                    }
+                    attempt(0);
+                }
+            </script>
         </div>
         <div id="advanced_tab" class="tabcontent">
             <div class="section-title">Advanced Settings</div>

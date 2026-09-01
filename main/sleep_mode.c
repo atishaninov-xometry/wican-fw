@@ -598,6 +598,7 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 #include "wc_timer.h"
 #include "hw_config.h"
 #include "sdcard.h"
+#include "obd_logger.h"
 #include "ble.h"
 
 #define ADC_UNIT          ADC_UNIT_1
@@ -961,6 +962,19 @@ void light_sleep_task(void *pvParameters)
                         if(dev_status_is_autopid_enabled())
                         {
                             dev_status_wait_for_bits(DEV_AUTOPID_IDLE_BIT, pdMS_TO_TICKS(20000));
+                        }
+                        // auto safe-flush the SD log on engine-off/sleep so no data
+                        // is lost (logger runs synchronous=OFF; nothing durable until checkpoint/unmount).
+                        // Wake from sleep always full-restarts, so the card re-mounts cleanly next boot.
+                        if(sdcard_is_mounted())
+                        {
+                            ESP_LOGW(TAG, "Sleep: flushing + unmounting SD log card...");
+                            if(obd_logger_is_initialized())
+                            {
+                                obd_logger_disable();
+                                obd_logger_lock_close();   // checkpoint WAL + sqlite3_close -> flush to .db
+                            }
+                            sd_card_deinit();              // unmount FATFS -> flush cache
                         }
                         elm327_sleep();
                         can_disable();

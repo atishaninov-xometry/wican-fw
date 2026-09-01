@@ -2322,6 +2322,83 @@ static esp_err_t std_pid_info_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* --- Manual clock set (no NTP needed) ---
+ * POST /set_time  body {"epoch": <utc-seconds>}  -> sets RX8130 RTC + system clock.
+ * GET  /get_time  -> {"epoch": <utc-seconds>} of the device's current clock.
+ * Used by the web UI "Set time" / "Borrow browser time" buttons. */
+static esp_err_t set_time_handler(httpd_req_t *req)
+{
+    char buf[128];
+    int total = req->content_len;
+    if (total <= 0 || total >= (int)sizeof(buf))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");
+        return ESP_FAIL;
+    }
+    int received = 0;
+    while (received < total)
+    {
+        int r = httpd_req_recv(req, buf + received, total - received);
+        if (r <= 0)
+        {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+            return ESP_FAIL;
+        }
+        received += r;
+    }
+    buf[received] = '\0';
+
+    time_t epoch = 0;
+    cJSON *root = cJSON_Parse(buf);
+    if (root)
+    {
+        cJSON *e = cJSON_GetObjectItem(root, "epoch");
+        if (cJSON_IsNumber(e))
+        {
+            epoch = (time_t)e->valuedouble;   /* seconds since 1970 UTC */
+        }
+        cJSON_Delete(root);
+    }
+
+    if (epoch < 1700000000)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing/implausible epoch");
+        return ESP_FAIL;
+    }
+
+    if (rtcm_set_from_unix(epoch) != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "RTC set failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static esp_err_t get_time_handler(httpd_req_t *req)
+{
+    char out[64];
+    time_t now = time(NULL);
+    snprintf(out, sizeof(out), "{\"epoch\":%lld}", (long long)now);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    return ESP_OK;
+}
+
+static const httpd_uri_t set_time_uri = {
+    .uri       = "/set_time",
+    .method    = HTTP_POST,
+    .handler   = set_time_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t get_time_uri = {
+    .uri       = "/get_time",
+    .method    = HTTP_GET,
+    .handler   = get_time_handler,
+    .user_ctx  = NULL
+};
+
 static const httpd_uri_t index_uri = {
     .uri       = "/",
     .method    = HTTP_GET,
@@ -3257,20 +3334,21 @@ static void config_server_load_cfg(char *cfg)
 
 	//*****
 	key = cJSON_GetObjectItem(root,"log_period");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(device_config.log_period, "10", sizeof(device_config.log_period));
 	}
 	else
 	{
-		uint32_t log_period = atoi(device_config.log_period);
+		/* clamp to [1,300]s (was an impossible `>300 && <1` check, so nothing was ever clamped) */
+		long log_period = strtol(key->valuestring, NULL, 10);
 
-		if(log_period > 300 && log_period < 1)
+		if(log_period < 1 || log_period > 300)
 		{
-			strlcpy(device_config.log_period, "10", sizeof(device_config.log_period));
+			log_period = 10;
 		}
 
-		strlcpy(device_config.log_period, key->valuestring, sizeof(device_config.log_period));
+		snprintf(device_config.log_period, sizeof(device_config.log_period), "%ld", log_period);
 	}
 	ESP_LOGI(TAG, "device_config.log_period: %s", device_config.log_period);
 	//*****
@@ -3489,6 +3567,8 @@ static void register_server_uris(void)
 	ESP_LOGI(TAG, "Registering URI handlers");
 	httpd_register_uri_handler(server, &index_uri);
 	httpd_register_uri_handler(server, &store_config_uri);
+	httpd_register_uri_handler(server, &set_time_uri);
+	httpd_register_uri_handler(server, &get_time_uri);
 	httpd_register_uri_handler(server, &check_status_uri);
 	httpd_register_uri_handler(server, &load_config_uri);
 	httpd_register_uri_handler(server, &logo_uri);
@@ -3671,7 +3751,9 @@ static httpd_handle_t config_server_init(void)
                        );
 
 	// Start the httpd server (reserve extra slots for cert manager endpoints)
-	config.max_uri_handlers = 38;
+	// bumped 38->48: the table was tuned to fit exactly, and overflowing it silently
+	// drops the last-registered handler (the wildcard static one -> all JS 404s)
+	config.max_uri_handlers = 48;
 	config.stack_size = (10*1024);
 	config.max_open_sockets = 15;
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
@@ -3864,12 +3946,12 @@ int8_t config_server_get_wakeup_interval(uint32_t *wakeup_interval)
         return -1;
     }
     
-    // Validate range
-    if (wk_int < 5 || wk_int > 240)
+    // Validate range (5 min .. 1440 min = 24 h)
+    if (wk_int < 5 || wk_int > 1440)
 	{
         return -1;
     }
-    
+
     *wakeup_interval = (uint32_t)wk_int;
     return 1;
 }

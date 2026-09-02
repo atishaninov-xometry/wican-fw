@@ -2554,7 +2554,7 @@ function disableSubmitWithError(message, duration = 5000) {
     return false;
 }
 
-// Shared logic for the manual-entry duration fields (Poll Interval, SD Write Interval,
+// Shared logic for the manual-entry duration fields (Logger Sample Interval, SD Write Interval,
 // Sleep After, Wakeup Every): each is a hidden input holding the value that actually
 // gets submitted (in the field's native unit), plus a range slider and a free-text box
 // (parsed via duration_parser.js) that both write into it. unit is the native unit

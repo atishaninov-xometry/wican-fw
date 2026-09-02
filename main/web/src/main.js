@@ -1087,8 +1087,8 @@ if (selectedPID) {
                 </tr>
                 <tr>
                     <td>Period(ms):</td>
-                    <td><input type="number" class="period-input" value="${rowData.Period || '1000'}" 
-                        min="100" max="120000"></td>
+                    <td><input type="number" class="period-input" value="${rowData.Period || '1000'}"
+                        min="10" max="120000"></td>
                 </tr>
                 <tr>
                     <td>Destination Type:</td>
@@ -2293,8 +2293,8 @@ async function storeAutoTableData() {
                 if (stdPIDData.Name.length === 0 || stdPIDData.Name.length >= 32) {
                     throw new Error("Name must not be empty and must be less than 32 characters");
                 }
-                if (!/^\d+$/.test(stdPIDData.Period) || (parseInt(stdPIDData.Period) < 1000 && parseInt(stdPIDData.Period) != 0)) {
-                    throw new Error("Period must be a number greater than 1000");
+                if (!/^\d+$/.test(stdPIDData.Period) || (parseInt(stdPIDData.Period) < 10 && parseInt(stdPIDData.Period) != 0)) {
+                    throw new Error("Period must be a number greater than 10");
                 }
                 if (stdPIDData.Send_to.length >= 64) {
                     throw new Error("Send_to must be less than 64 characters");

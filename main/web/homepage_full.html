@@ -1918,13 +1918,13 @@
                 <tr>
                     <td>Logger Sample Interval:</td>
                     <td class="slider-container">
-                        <input type="hidden" id="log_poll_period" name="log_poll_period" value="1000" data-min="50" data-max="300000">
+                        <input type="hidden" id="log_poll_period" name="log_poll_period" value="1000" data-min="10" data-max="300000">
                         <input type="range"
                             id="log_poll_period_slider"
                             value="1000"
-                            min="50"
+                            min="10"
                             max="10000"
-                            step="50"
+                            step="10"
                             oninput="durationSliderInput('log_poll_period', this.value, 'ms');">
                         <span id="log_poll_period_value">1000</span>ms
                         <input type="text" class="duration-text" id="log_poll_period_text" value="1s"
@@ -1939,16 +1939,16 @@
                 <tr>
                     <td>SD Write Interval:</td>
                     <td class="slider-container">
-                        <input type="hidden" id="log_period" name="log_period" value="10" data-min="1" data-max="300">
+                        <input type="hidden" id="log_period" name="log_period" value="5" data-min="1" data-max="300">
                         <input type="range"
                             id="log_period_slider"
-                            value="10"
+                            value="5"
                             min="1"
                             max="300"
                             step="1"
                             oninput="durationSliderInput('log_period', this.value, 's');">
-                        <span id="log_period_value">10</span>sec
-                        <input type="text" class="duration-text" id="log_period_text" value="10s"
+                        <span id="log_period_value">5</span>sec
+                        <input type="text" class="duration-text" id="log_period_text" value="5s"
                             placeholder="e.g. 30s, 2m"
                             title="Type an exact value: 30s, 2m, 1m 30s, ..."
                             onchange="durationTextInput('log_period', this.value, 's');">

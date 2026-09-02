@@ -966,7 +966,7 @@ void app_main(void)
 		if(config_server_get_log_period(&log_period) == -1)
 		{
 			ESP_LOGE(TAG, "error getting log period");
-			log_period = 60;
+			log_period = 5;
 		}
 		uint32_t log_poll_period = 0;
 		if(config_server_get_log_poll_period(&log_poll_period) == -1)

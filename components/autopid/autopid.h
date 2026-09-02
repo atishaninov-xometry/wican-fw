@@ -129,6 +129,10 @@ typedef struct
     int64_t timer;
     float value;
     bool failed;
+    // For PID_STD only: the resolved std_parameter_t* from obd2_standard_pids.h,
+    // looked up once at config-parse time. Runtime decoding uses this instead of
+    // re-deriving it from name, so name is free to be a user-chosen label.
+    const void *std_param;
 }parameter_t;
 
 typedef struct 

@@ -937,6 +937,8 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                             {
                                 curr_pid->parameters->class = strdup_psram(pid_info->params[i].class);
                                 curr_pid->parameters->unit = strdup_psram(pid_info->params[i].unit);
+                                // Resolve the decode rule now; runtime no longer needs the name for it.
+                                curr_pid->parameters->std_param = &pid_info->params[i];
                                 char pid_hex[3];
                                 strncpy(pid_hex, curr_pid->parameters->name, 2);
                                 pid_hex[2] = '\0';
@@ -945,6 +947,19 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                                 if (curr_pid->cmd)
                                 {
                                     sprintf(curr_pid->cmd, "01%s\r", pid_hex);
+                                }
+
+                                // "Label" is the user-facing name (MQTT topic, logger column,
+                                // dashboard). "Name" stays the identity that selected this PID,
+                                // and is only needed up to this point.
+                                const char *label = json_get_string(cJSON_GetObjectItem(pid, "Label"));
+                                if (label != NULL && label[0] != '\0')
+                                {
+                                    char *renamed = strdup_psram(label);
+                                    if (renamed != NULL)
+                                    {
+                                        curr_pid->parameters->name = renamed;
+                                    }
                                 }
                             }
                         }

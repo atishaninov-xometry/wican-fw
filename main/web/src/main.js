@@ -1078,7 +1078,10 @@ if (selectedPID) {
             <table class="compact-form-table">
                 <tr>
                     <td>Name:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</td>
-                    <td><input type="text" class="name-input" value="${selectedPID}" readonly></td>
+                    <td><input type="hidden" class="std-pid-id" value="${selectedPID}">
+                        <input type="text" class="name-input" value="${rowData.Label || selectedPID}"
+                            title="Free to rename - the PID itself is remembered separately"
+                            oninput="submit_enable();"></td>
                 </tr>
                 <tr>
                     <td>Receive Header:</td>
@@ -2053,6 +2056,7 @@ function loadAutoTable(jsonData) {
                 console.log(`Loading Standard PID ${index}:`, pidData);
                 addSelectedPID({
                     Name: pidData.Name || '',
+                    Label: pidData.Label || '',
                     ReceiveHeader: pidData.ReceiveHeader || '',
                     Period: pidData.Period || '',
                     Type: pidData.Type || 'Default',
@@ -2282,7 +2286,10 @@ async function storeAutoTableData() {
         if(standardEntries?.length) {
             standardEntries.forEach((entry, index) => {
                 const stdPIDData = {
-                    Name: entry.querySelector('.name-input')?.value || '',
+                    // Name is the PID's identity (e.g. "0C-EngineRPM") and selects the
+                    // decode rule; Label is what the user renamed it to.
+                    Name: entry.querySelector('.std-pid-id')?.value || '',
+                    Label: entry.querySelector('.name-input')?.value || '',
                     ReceiveHeader: entry.querySelector('.receive-header-input')?.value || '',
                     Period: entry.querySelector('.period-input')?.value || '',
                     Type: entry.querySelector('.type-select')?.value || 'Default',
@@ -2290,7 +2297,10 @@ async function storeAutoTableData() {
                     enabled: entry.querySelector('.enabled-chk')?.checked !== false
                 };
 
-                if (stdPIDData.Name.length === 0 || stdPIDData.Name.length >= 32) {
+                if (stdPIDData.Name.length === 0) {
+                    throw new Error("Standard PID entry lost its PID identity - re-add the PID");
+                }
+                if (stdPIDData.Label.length === 0 || stdPIDData.Label.length >= 32) {
                     throw new Error("Name must not be empty and must be less than 32 characters");
                 }
                 if (!/^\d+$/.test(stdPIDData.Period) || (parseInt(stdPIDData.Period) < 10 && parseInt(stdPIDData.Period) != 0)) {

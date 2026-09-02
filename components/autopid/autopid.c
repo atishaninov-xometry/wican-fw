@@ -481,9 +481,90 @@ static uint8_t autopid_std_pid_data_len(uint8_t pid_num)
 // Poll every due Standard PID in one batched Mode-01 request instead of one
 // request per PID. Re-arms the timer for every PID it services, so the
 // per-PID loop below just finds it not due and skips it.
+// Parse "01XX" (optionally followed by the vehicle-profile frame-count digit and
+// the terminating CR) into the single PID number it asks for. A different mode, a
+// multi-PID request or any other tail is not batchable through here.
+static bool autopid_batch_pid_num_from_cmd(const char *cmd, uint8_t *out_pid)
+{
+    if (cmd == NULL || out_pid == NULL)
+    {
+        return false;
+    }
+    if (cmd[0] != '0' || cmd[1] != '1')
+    {
+        return false;
+    }
+    if (!isxdigit((unsigned char)cmd[2]) || !isxdigit((unsigned char)cmd[3]))
+    {
+        return false;
+    }
+
+    uint32_t frame_digits = 0;
+    for (const char *tail = &cmd[4]; *tail != '\0' && *tail != '\r'; tail++)
+    {
+        if (!isdigit((unsigned char)*tail) || frame_digits > 0)
+        {
+            return false;
+        }
+        frame_digits++;
+    }
+
+    char pid_hex[3] = { cmd[2], cmd[3], '\0' };
+    *out_pid = (uint8_t)strtol(pid_hex, NULL, 16);
+    return true;
+}
+
+// Largest Bn/Sn index an expression touches. The synthetic buffer a batch builds
+// is [PCI][41][PID][data...], so referencing Bn needs (n - 2) data bytes to be
+// present - and the standard table's canonical length is all the batch walker
+// has to go by. PID 0x65 is the case that matters: the table calls it 1 byte
+// while RecommendedGear reads B4, so it must not batch.
+static uint8_t autopid_expr_max_byte_index(const char *expr)
+{
+    uint8_t max_idx = 0;
+
+    if (expr == NULL)
+    {
+        return 0;
+    }
+    for (const char *p = expr; *p != '\0'; p++)
+    {
+        if ((*p == 'B' || *p == 'S') && isdigit((unsigned char)p[1]))
+        {
+            unsigned long idx = strtoul(p + 1, NULL, 10);
+
+            if (idx <= 255 && (uint8_t)idx > max_idx)
+            {
+                max_idx = (uint8_t)idx;
+            }
+        }
+    }
+    return max_idx;
+}
+
+// A vehicle-specific entry may join the batch only if it is header-compatible
+// with it: one init is sent for the whole request, so an entry needing its own
+// header (a 760/DSC query) or its own ATCRA filter stays on the per-PID path.
+static bool autopid_batch_specific_is_eligible(const pid_data_t *curr_pid)
+{
+    if (curr_pid->pid_type != PID_SPECIFIC || !autopid_config->pid_specific_en)
+    {
+        return false;
+    }
+    if (curr_pid->rxheader != NULL && strlen(curr_pid->rxheader) > 0)
+    {
+        return false;
+    }
+    if (curr_pid->init == NULL)
+    {
+        return true; // inherits the batch's own 7DF header
+    }
+    return (strstr(curr_pid->init, "7DF") != NULL);
+}
+
 static void autopid_poll_std_pids_batched(pid_type_t *previous_pid_type)
 {
-    if (!autopid_config->pid_std_en)
+    if (!autopid_config->pid_std_en && !autopid_config->pid_specific_en)
     {
         return;
     }
@@ -495,6 +576,7 @@ static void autopid_poll_std_pids_batched(pid_type_t *previous_pid_type)
     {
         parameter_t *param;
         uint8_t pid_num;
+        bool is_std;
     } apply_list[AUTOPID_STD_APPLY_MAX];
     uint32_t apply_count = 0;
 
@@ -506,53 +588,88 @@ static void autopid_poll_std_pids_batched(pid_type_t *previous_pid_type)
     for (uint32_t i = 0; i < autopid_config->pid_count; i++)
     {
         pid_data_t *curr_pid = &autopid_config->pids[i];
-        if (curr_pid->pid_type != PID_STD || !curr_pid->enabled || curr_pid->parameters_count == 0)
+        bool is_std = (curr_pid->pid_type == PID_STD);
+
+        if (!curr_pid->enabled || curr_pid->parameters_count == 0)
         {
             continue;
         }
-        parameter_t *param = &curr_pid->parameters[0];
-        if (!param->enabled || !wc_timer_is_expired(&param->timer))
-        {
-            continue;
-        }
-        if (curr_pid->cmd == NULL || strlen(curr_pid->cmd) < 4)
+        if (is_std ? !autopid_config->pid_std_en : !autopid_batch_specific_is_eligible(curr_pid))
         {
             continue;
         }
 
-        char pid_hex[3] = { curr_pid->cmd[2], curr_pid->cmd[3], '\0' };
-        uint8_t pid_num = (uint8_t)strtol(pid_hex, NULL, 16);
-
-        bool already_in_batch = false;
-        for (uint32_t b = 0; b < batch_count; b++)
+        uint8_t pid_num = 0;
+        if (!autopid_batch_pid_num_from_cmd(curr_pid->cmd, &pid_num))
         {
-            if (batch_pids[b] == pid_num)
+            continue;
+        }
+        // Response walking needs the canonical length, so a PID the standard
+        // table doesn't describe can't be batched - it falls to the per-PID loop.
+        if (autopid_std_pid_data_len(pid_num) == 0)
+        {
+            continue;
+        }
+
+        // A standard entry always has exactly one parameter; a profile entry can
+        // have several sharing this one response (e.g. 012F -> fuel %, litres,
+        // litres-to-empty), and all of them are served by the single request.
+        for (uint32_t p = 0; p < curr_pid->parameters_count; p++)
+        {
+            parameter_t *param = &curr_pid->parameters[p];
+
+            if (!param->enabled || !wc_timer_is_expired(&param->timer))
             {
-                already_in_batch = true;
+                continue;
+            }
+            if (!is_std)
+            {
+                uint8_t needs_byte = autopid_expr_max_byte_index(param->expression);
+
+                // Skip an expression the batch's synthetic buffer can't cover;
+                // the per-PID path parses the real response and handles it.
+                if (needs_byte < 3 ||
+                    (uint32_t)(needs_byte - 2) > autopid_std_pid_data_len(pid_num))
+                {
+                    continue;
+                }
+            }
+            if (apply_count >= AUTOPID_STD_APPLY_MAX)
+            {
                 break;
             }
-        }
 
-        if (!already_in_batch)
-        {
-            if (batch_count >= AUTOPID_STD_BATCH_MAX)
+            bool already_in_batch = false;
+            for (uint32_t b = 0; b < batch_count; b++)
             {
-                continue; // doesn't fit this round; stays due, picked up next pass
+                if (batch_pids[b] == pid_num)
+                {
+                    already_in_batch = true;
+                    break;
+                }
             }
-            batch_pids[batch_count++] = pid_num;
-            cmd[cmd_len++] = pid_hex[0];
-            cmd[cmd_len++] = pid_hex[1];
-        }
 
-        // May be a second param sharing an already-batched PID.
-        if (apply_count < AUTOPID_STD_APPLY_MAX)
-        {
+            if (!already_in_batch && batch_count >= AUTOPID_STD_BATCH_MAX)
+            {
+                break; // doesn't fit this round; stays due, picked up next pass
+            }
+
+            if (!already_in_batch)
+            {
+                char pid_hex[3];
+                snprintf(pid_hex, sizeof(pid_hex), "%02X", pid_num);
+                batch_pids[batch_count++] = pid_num;
+                cmd[cmd_len++] = pid_hex[0];
+                cmd[cmd_len++] = pid_hex[1];
+            }
+
             apply_list[apply_count].param = param;
             apply_list[apply_count].pid_num = pid_num;
+            apply_list[apply_count].is_std = is_std;
             apply_count++;
-        }
 
-        autopid_rearm_param_timer(param);
+            autopid_rearm_param_timer(param);
+        }
     }
 
     if (batch_count == 0)
@@ -562,11 +679,18 @@ static void autopid_poll_std_pids_batched(pid_type_t *previous_pid_type)
     cmd[cmd_len++] = '\r';
     cmd[cmd_len] = '\0';
 
+    // Resend the header for every batch, so a preceding custom/specific query
+    // that left it on another ECU can't wedge this request. standard_init only
+    // exists when the Standard PIDs tab has entries, so a profile-only setup
+    // falls back to the functional address the batched Mode-01 request needs.
+    const char *batch_init = "ATSH7DF\r";
     if (autopid_config->standard_init && strlen(autopid_config->standard_init) > 0)
     {
-        ESP_LOGI(TAG, "Sending standard init: %s", autopid_config->standard_init);
-        send_commands(autopid_config->standard_init, 2);
+        batch_init = autopid_config->standard_init;
     }
+    ESP_LOGI(TAG, "Sending batch init: %s", batch_init);
+    send_commands((char *)batch_init, 2);
+
     *previous_pid_type = PID_STD;
 
     ESP_LOGI(TAG, "Executing batched std PID command: %s (%lu PIDs)", cmd, (unsigned long)batch_count);
@@ -666,30 +790,43 @@ static void autopid_poll_std_pids_batched(pid_type_t *previous_pid_type)
         synth[2] = apply_list[a].pid_num;
         memcpy(&synth[3], &payload[pid_offset[b]], pid_len[b]);
 
-        const std_pid_t *pid_info = get_pid_from_string(param->name);
-        const char *param_name = param->name ? strchr(param->name, '-') : NULL;
         bool matched = false;
 
-        if (pid_info && param_name)
+        if (apply_list[a].is_std)
         {
-            for (int pi = 0; pi < pid_info->num_params; pi++)
+            const std_parameter_t *std_param = (const std_parameter_t *)param->std_param;
+            float value = 0.0f;
+
+            if (std_param != NULL &&
+                extract_signal_value(synth, (uint8_t)(3 + pid_len[b]), std_param, &value) == ESP_OK)
             {
-                if (strcmp(pid_info->params[pi].name, param_name + 1) == 0)
+                matched = true;
+                param->failed = false;
+                if (autopid_prepare_parameter_value(param, value, &param->value, "STD"))
                 {
-                    float value = 0.0f;
-                    if (extract_signal_value(synth, (uint8_t)(3 + pid_len[b]), &pid_info->params[pi], &value) == ESP_OK)
-                    {
-                        matched = true;
-                        param->failed = false;
-                        if (autopid_prepare_parameter_value(param, value, &param->value, "STD"))
-                        {
-                            ESP_LOGI(TAG, "Parameter %s (batched) result: %.2f %s",
-                                     param->name, param->value, pid_info->params[pi].unit);
-                            autopid_config->last_successful_pid_time = time(NULL);
-                            publish_parameter_mqtt(param);
-                        }
-                    }
-                    break;
+                    ESP_LOGI(TAG, "Parameter %s (batched) result: %.2f %s",
+                             param->name, param->value, std_param->unit);
+                    autopid_config->last_successful_pid_time = time(NULL);
+                    publish_parameter_mqtt(param);
+                }
+            }
+        }
+        else
+        {
+            // Vehicle-specific PID: same synthetic single-frame buffer, so the
+            // profile's own expression (B3 = first data byte) applies unchanged.
+            double result = 0.0;
+
+            if (param->expression != NULL &&
+                evaluate_expression((uint8_t *)param->expression, synth, 0, &result))
+            {
+                matched = true;
+                param->failed = false;
+                if (autopid_prepare_parameter_value(param, result, &param->value, "PID"))
+                {
+                    ESP_LOGI(TAG, "Parameter %s (batched) result: %.2f", param->name, param->value);
+                    autopid_config->last_successful_pid_time = time(NULL);
+                    publish_parameter_mqtt(param);
                 }
             }
         }
@@ -4379,15 +4516,76 @@ static void autopid_task(void *pvParameters)
                                     if (curr_pid->pid_type == PID_CUSTOM || curr_pid->pid_type == PID_SPECIFIC)
                                     {
                                         ESP_LOGI(TAG, "Processing custom/specific PID");
-                                        if (param->expression &&
-                                            evaluate_expression((uint8_t *)param->expression,
-                                                                elm327_response.data, 0, &result))
+                                        // Serve every due parameter of this PID from this one
+                                        // response - several can be derived from the same raw
+                                        // bytes (e.g. 012F -> fuel %, litres, litres-to-empty),
+                                        // and re-requesting per parameter just burns cycles.
+                                        // Re-arming them here also makes the loop skip them.
+                                        for (uint32_t q = p; q < curr_pid->parameters_count; q++)
                                         {
-                                            param->failed = false;
-                                            if (autopid_prepare_parameter_value(param, result, &param->value, "PID"))
+                                            parameter_t *sibling = &curr_pid->parameters[q];
+
+                                            if (q != p &&
+                                                (!sibling->enabled || !wc_timer_is_expired(&sibling->timer)))
                                             {
-                                                ESP_LOGI(TAG, "Parameter %s result: %.2f",
-                                                         param->name, param->value);
+                                                continue;
+                                            }
+                                            if (q != p)
+                                            {
+                                                autopid_rearm_param_timer(sibling);
+                                            }
+
+                                            if (sibling->expression &&
+                                                evaluate_expression((uint8_t *)sibling->expression,
+                                                                    elm327_response.data, 0, &result))
+                                            {
+                                                sibling->failed = false;
+                                                if (autopid_prepare_parameter_value(sibling, result, &sibling->value, "PID"))
+                                                {
+                                                    ESP_LOGI(TAG, "Parameter %s result: %.2f",
+                                                             sibling->name, sibling->value);
+                                                    autopid_config->last_successful_pid_time = time(NULL);
+                                                    publish_parameter_mqtt(sibling);
+                                                }
+                                            }
+                                            else
+                                            {
+                                                sibling->failed = true;
+                                                ESP_LOGW(TAG, "Parameter %s expression evaluation failed",
+                                                         sibling->name ? sibling->name : "(null)");
+                                            }
+                                        }
+                                    }
+                                    else if (curr_pid->pid_type == PID_STD)
+                                    {
+                                        const std_parameter_t *std_param = (const std_parameter_t *)param->std_param;
+
+                                        ESP_LOGI(TAG, "Processing standard PID %s", param->name);
+                                        if (std_param != NULL)
+                                        {
+                                            esp_err_t err;
+
+                                            if (elm327_response.priority_data != NULL)
+                                            {
+                                                err = extract_signal_value(elm327_response.priority_data,
+                                                                           elm327_response.priority_data_len,
+                                                                           std_param, &param->value);
+                                            }
+                                            else
+                                            {
+                                                err = extract_signal_value(elm327_response.data,
+                                                                           elm327_response.length,
+                                                                           std_param, &param->value);
+                                            }
+
+                                            if (err != ESP_OK)
+                                            {
+                                                ESP_LOGE(TAG, "Failed to extract signal: %s", esp_err_to_name(err));
+                                            }
+                                            else if (autopid_prepare_parameter_value(param, param->value, &param->value, "STD"))
+                                            {
+                                                ESP_LOGI(TAG, "Parameter %s result: %.2f %s",
+                                                         param->name, param->value, std_param->unit);
                                                 autopid_config->last_successful_pid_time = time(NULL);
                                                 publish_parameter_mqtt(param);
                                             }
@@ -4395,66 +4593,8 @@ static void autopid_task(void *pvParameters)
                                         else
                                         {
                                             param->failed = true;
-                                            ESP_LOGW(TAG, "Parameter %s expression evaluation failed",
+                                            ESP_LOGW(TAG, "Standard parameter %s has no resolved decode rule",
                                                      param->name ? param->name : "(null)");
-                                        }
-                                    }
-                                    else if (curr_pid->pid_type == PID_STD)
-                                    {
-                                        ESP_LOGI(TAG, "Processing standard PID");
-                                        if (curr_pid->pid_type == PID_STD)
-                                        {
-                                            const std_pid_t *pid_info = get_pid_from_string(param->name);
-                                            if (pid_info)
-                                            {
-                                                ESP_LOGI(TAG, "Found PID info for: %s", param->name);
-                                                // Find matching parameter in pid_info
-                                                for (int p = 0; p < pid_info->num_params; p++)
-                                                {
-                                                    // Match parameter name after the dash
-                                                    const char *param_name = strchr(param->name, '-');
-                                                    if (param_name && strcmp(param_name + 1, pid_info->params[p].name) == 0)
-                                                    {
-                                                        esp_err_t err = ESP_FAIL;
-
-                                                        ESP_LOGI(TAG, "Processing parameter: %s", pid_info->params[p].name);
-                                                        if (elm327_response.priority_data != NULL && elm327_response.priority_data != 0)
-                                                        {
-                                                            err = extract_signal_value(
-                                                                elm327_response.priority_data,     // Your CAN response data buffer
-                                                                elm327_response.priority_data_len, // Length of your CAN response data
-                                                                &pid_info->params[p],              // Parameter definition from pid_info
-                                                                &param->value                      // Where to store the result
-                                                            );
-                                                        }
-                                                        else
-                                                        {
-                                                            err = extract_signal_value(
-                                                                elm327_response.data,   // Your CAN response data buffer
-                                                                elm327_response.length, // Length of your CAN response data
-                                                                &pid_info->params[p],   // Parameter definition from pid_info
-                                                                &param->value           // Where to store the result
-                                                            );
-                                                        }
-
-                                                        if (err != ESP_OK)
-                                                        {
-                                                            ESP_LOGE(TAG, "Failed to extract signal: %s", esp_err_to_name(err));
-                                                            break;
-                                                        }
-                                                        if (autopid_prepare_parameter_value(param, param->value, &param->value, "STD"))
-                                                        {
-                                                            ESP_LOGI(TAG, "Parameter %s result: %.2f %s",
-                                                                     param->name,
-                                                                     param->value,
-                                                                     pid_info->params[p].unit);
-                                                            autopid_config->last_successful_pid_time = time(NULL);
-                                                            publish_parameter_mqtt(param);
-                                                        }
-                                                        break;
-                                                    }
-                                                }
-                                            }
                                         }
                                     }
                                 }

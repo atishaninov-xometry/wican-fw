@@ -1,0 +1,197 @@
+{
+    "car_model": "Mazda MX-5 ND3 (2024+)",
+    "init": "ATSP6;",
+    "pids": [
+        {
+            "pid": "010C1",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "EngineRPM",
+                    "expression": "[B3:B4]/4",
+                    "unit": "rpm",
+                    "class": "frequency",
+                    "period": 100
+                }
+            ]
+        },
+        {
+            "pid": "010D1",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "VehicleSpeed",
+                    "expression": "B3",
+                    "unit": "km/h",
+                    "class": "speed",
+                    "period": 100
+                }
+            ]
+        },
+        {
+            "pid": "01111",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "ThrottlePos",
+                    "expression": "B3*100/255",
+                    "unit": "%",
+                    "class": "none",
+                    "period": 100
+                }
+            ]
+        },
+        {
+            "pid": "014C1",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "ThrottleCmd",
+                    "expression": "B3*100/255",
+                    "unit": "%",
+                    "class": "none",
+                    "period": 100
+                }
+            ]
+        },
+        {
+            "pid": "01431",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "EngineLoad",
+                    "expression": "[B3:B4]*100/255",
+                    "unit": "%",
+                    "class": "none",
+                    "period": 100
+                }
+            ]
+        },
+        {
+            "pid": "015E1",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "FuelRate",
+                    "expression": "[B3:B4]/20",
+                    "unit": "L/h",
+                    "class": "none",
+                    "period": 100
+                }
+            ]
+        },
+        {
+            "pid": "01A41",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "Gear",
+                    "expression": "B4/16",
+                    "unit": "none",
+                    "class": "none",
+                    "period": 200
+                },
+                {
+                    "name": "GearRatio",
+                    "expression": "[B5:B6]/1000",
+                    "unit": "ratio",
+                    "class": "none",
+                    "period": 1000,
+                    "enabled": false
+                }
+            ]
+        },
+        {
+            "pid": "01651",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "RecommendedGear",
+                    "expression": "B4/16",
+                    "unit": "none",
+                    "class": "none",
+                    "period": 500
+                }
+            ]
+        },
+        {
+            "pid": "01051",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "CoolantTemp",
+                    "expression": "B3-40",
+                    "unit": "degC",
+                    "class": "temperature",
+                    "period": 10000
+                }
+            ]
+        },
+        {
+            "pid": "010F1",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "IntakeAirTemp",
+                    "expression": "B3-40",
+                    "unit": "degC",
+                    "class": "temperature",
+                    "period": 10000
+                }
+            ]
+        },
+        {
+            "pid": "01421",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "Battery",
+                    "expression": "[B3:B4]/1000",
+                    "unit": "V",
+                    "class": "voltage",
+                    "period": 10000
+                }
+            ]
+        },
+        {
+            "pid": "012F1",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "FuelPct",
+                    "expression": "B3*100/255",
+                    "unit": "%",
+                    "class": "none",
+                    "period": 10000
+                },
+                {
+                    "name": "FuelLevel_L",
+                    "expression": "B3*45/255",
+                    "unit": "L",
+                    "class": "none",
+                    "period": 10000
+                },
+                {
+                    "name": "FuelEmpty_L",
+                    "expression": "45-(B3*45/255)",
+                    "unit": "L",
+                    "class": "none",
+                    "period": 10000
+                }
+            ]
+        },
+        {
+            "pid": "01A61",
+            "pid_init": "ATSH7DF;",
+            "parameters": [
+                {
+                    "name": "Odometer",
+                    "expression": "[B3:B6]/10",
+                    "unit": "km",
+                    "class": "distance",
+                    "period": 10000
+                }
+            ]
+        }
+    ]
+}

@@ -14,24 +14,12 @@ typedef struct {
     const char *metadata; // JSON metadata string
 } obd_param_entry_t;
 
-// Structure to hold parameter name and value pairs for logging
-typedef struct {
-    const char *name;
-    float value;
-    float old_value;
-    bool changed;
-} param_value_t;
-
-// Typedef for the get parameters callback function
-typedef char* (*obd_logger_get_params_cb_t)(void);
-
 // structure to hold logger init parameters
 typedef struct{
     char* path;
-    uint32_t period_sec;     // how often changed values are flushed to the SD card, seconds
-    uint32_t poll_period_ms; // how often live values are sampled into RAM, milliseconds
+    uint32_t period_sec;     // how often buffered samples are flushed to the SD card, seconds
+    uint32_t poll_period_ms; // minimum spacing between recorded samples of one parameter, milliseconds
     char* db_filename;
-    obd_logger_get_params_cb_t obd_logger_get_params_cb;
     obd_param_entry_t *obd_logger_params;
     uint32_t obd_logger_params_count;
 }obd_logger_t;
@@ -40,7 +28,10 @@ typedef int (*obd_logger_db_exec_cb)(void *data, int argc, char **argv, char **a
 
 esp_err_t odb_logger_init(obd_logger_t *obd_logger);
 esp_err_t obd_logger_init_params(const obd_param_entry_t *param_entries, size_t count);
-esp_err_t obd_logger_store_params(const param_value_t *params, size_t count);
+/* Record one freshly acquired value. Called from the acquisition path (not on a
+ * timer) so the row carries the millisecond timestamp of the value itself. The
+ * sample is buffered in RAM and written out by the logger task. */
+void obd_logger_record_sample(const char *name, float value);
 esp_err_t obd_logger_lock(uint32_t wait_ms);
 void obd_logger_unlock(void);
 void obd_logger_lock_close(void);

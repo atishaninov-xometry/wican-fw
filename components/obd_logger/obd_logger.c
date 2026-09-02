@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <sys/unistd.h>
+#include <sys/time.h>
 #include <time.h>
 #include <math.h>
 #include <float.h>
@@ -35,7 +36,6 @@
 #include "string.h"
 #include "rtcm.h"
 #include "obd_logger.h"
-#include "cJSON.h"
 #include "obd_logger_iface.h"
 #include "obd_logger_db_manager.h"
 
@@ -49,8 +49,9 @@
 #define OBD_LOGGER_ENABLED_BIT      BIT1
 #define OBD_LOGGER_DISABLED_BIT     BIT2
 
-// Create param_data table
-const char *sql_param_data = 
+// Create param_data table. timestamp is Unix epoch MILLISECONDS (not seconds):
+// one row per acquired sample, stamped when the value arrived.
+const char *sql_param_data =
     "CREATE TABLE IF NOT EXISTS param_data ("
     "timestamp INTEGER, "
     "param_id INTEGER, "
@@ -66,11 +67,32 @@ const char *sql_param_info =
     "Data JSON"
     ");";
 
+// Buffered samples waiting to be written. 16 parameters sampled every 10ms is
+// 1600 samples/s, so this holds a few seconds of worst-case traffic; the task
+// also flushes early once SAMPLE_BUF_HIGH_WATER is crossed, so a fast sample
+// rate cannot overrun a slow SD write interval.
+#define SAMPLE_BUF_ENTRIES 8192
+#define SAMPLE_BUF_HIGH_WATER ((SAMPLE_BUF_ENTRIES * 3) / 4)
+
+// How often the logger task checks whether a flush is due. The samples
+// themselves are pushed in by the acquisition path, so this is only a
+// supervisor tick and can stay coarse.
+#define FLUSH_CHECK_PERIOD_MS 50
+
+typedef struct {
+    int64_t ts_ms;
+    int32_t param_idx; // index into param_lookup - stays valid across a rotation, unlike the per-file row id
+    float value;
+} obd_sample_t;
+
 // Define a structure for the parameter lookup table
 typedef struct {
     int id;
     char name[50];
     char type[50];
+    char data[128];       // metadata JSON, retained so param_info can be rebuilt after a rotation
+    float last_value;     // last recorded value, for the delta gate
+    int64_t last_ts_ms;   // when it was recorded, for the sample-spacing gate (0 = never)
 } param_lookup_t;
 
 // Global lookup table
@@ -81,11 +103,33 @@ static sqlite3 *db_file = NULL;
 static SemaphoreHandle_t db_mutex = NULL;
 static char db_path[128] = {0};
 static uint32_t logger_period = 0; // SD write interval, seconds
-static uint32_t poll_period = 0;   // RAM sampling interval, milliseconds
+static uint32_t poll_period = 0;   // minimum spacing between samples of one parameter, milliseconds
 static uint32_t obd_logger_params_count = 0;
-static obd_logger_get_params_cb_t obd_logger_get_params = NULL;
 static EventGroupHandle_t obd_logger_event_group = NULL;
 static StaticEventGroup_t obd_logger_event_group_buffer;
+
+// sample_mutex guards both buffers below and the mutable fields of param_lookup.
+// It is never held while touching the database, so it can't block acquisition
+// behind an SD write.
+static SemaphoreHandle_t sample_mutex = NULL;
+static obd_sample_t *sample_buf = NULL;   // filling
+static obd_sample_t *flush_buf = NULL;    // swapped in at flush time
+static uint32_t sample_used = 0;
+static uint32_t sample_dropped = 0;
+
+// Wall-clock milliseconds. The system clock is set from the RTC at boot
+// (rtcm_sync_system_time_from_rtc), and gettimeofday() resolves to
+// microseconds off esp_timer, so this is precise between clock syncs.
+static int64_t obd_logger_now_ms(void)
+{
+    struct timeval tv;
+
+    if (gettimeofday(&tv, NULL) != 0)
+    {
+        return 0;
+    }
+    return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
+}
 
 /**
  * @brief Enable OBD logging
@@ -219,6 +263,54 @@ static int obd_logger_db_exec(sqlite3 *db, const char *sql) {
 /**
  * @brief Handler for database manager events
  */
+/**
+ * @brief Re-insert the known parameters into a freshly rotated param_info table
+ *
+ * Row ids are per-file, so this also refreshes the ids in the lookup table.
+ * Caller must hold db_mutex.
+ */
+static void obd_logger_repopulate_params(void)
+{
+    char query[512];
+    sqlite3_stmt *stmt;
+
+    if (db_file == NULL || param_count == 0)
+    {
+        return;
+    }
+
+    for (int i = 0; i < param_count; i++)
+    {
+        snprintf(query, sizeof(query),
+                 "INSERT OR IGNORE INTO param_info (Name, Type, Data) VALUES ('%s', '%s', '%s');",
+                 param_lookup[i].name, param_lookup[i].type, param_lookup[i].data);
+        obd_logger_db_exec(db_file, query);
+    }
+
+    if (sqlite3_prepare_v2(db_file, "SELECT Id, Name FROM param_info;", -1, &stmt, NULL) != SQLITE_OK)
+    {
+        ESP_LOGE(TAG, "Failed to re-read param_info after rotation: %s", sqlite3_errmsg(db_file));
+        return;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        const char *name = (const char *)sqlite3_column_text(stmt, 1);
+
+        for (int i = 0; i < param_count; i++)
+        {
+            if (name != NULL && strcmp(param_lookup[i].name, name) == 0)
+            {
+                param_lookup[i].id = sqlite3_column_int(stmt, 0);
+                break;
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    ESP_LOGI(TAG, "Re-populated param_info with %d parameters after rotation", param_count);
+}
+
 static void obd_logger_db_event_handler(obd_db_event_t event, void* event_data)
 {
     switch (event) {
@@ -252,11 +344,17 @@ static void obd_logger_db_event_handler(obd_db_event_t event, void* event_data)
                         // Initialize tables in the new database
                         obd_logger_db_exec(db_file, sql_param_data);
                         obd_logger_db_exec(db_file, sql_param_info);
-                        
+
                         // Set performance-optimized journal mode
                         obd_logger_db_exec(db_file, "PRAGMA journal_mode = WAL;");
                         obd_logger_db_exec(db_file, "PRAGMA synchronous = NORMAL;");
                         obd_logger_db_exec(db_file, "PRAGMA cache_size = 20000;");
+
+                        // param_info starts out empty in the new file, so re-insert
+                        // the parameters we know about. Without this every rotated
+                        // file holds param_data rows whose param_id resolves to
+                        // nothing - and at a fast sample rate rotation happens often.
+                        obd_logger_repopulate_params();
                     }
                     
                     // If we took the mutex during rotation start, release it now
@@ -456,47 +554,61 @@ esp_err_t obd_logger_init_params(const obd_param_entry_t *param_entries, size_t 
     
     // Try to insert parameters - if they already exist, it will fail but that's fine
     char query[512];
-    for (size_t i = 0; i < count; i++) 
+    for (size_t i = 0; i < count; i++)
     {
-        snprintf(query, sizeof(query), 
-                 "INSERT OR IGNORE INTO param_info (Name, Type, Data) VALUES ('%s', '%s', '%s');", 
+        snprintf(query, sizeof(query),
+                 "INSERT OR IGNORE INTO param_info (Name, Type, Data) VALUES ('%s', '%s', '%s');",
                  param_entries[i].name, param_entries[i].type, param_entries[i].metadata);
         obd_logger_db_exec(db_file, query);
     }
-    
+
     // Now query all parameters to build the lookup table
     sqlite3_stmt *stmt;
-    const char *sql = "SELECT Id, Name, Type FROM param_info;";
+    const char *sql = "SELECT Id, Name, Type, Data FROM param_info;";
     int rc = sqlite3_prepare_v2(db_file, sql, -1, &stmt, NULL);
-    
+
     if (rc != SQLITE_OK)
     {
         ESP_LOGE(TAG, "Failed to prepare statement: %s", sqlite3_errmsg(db_file));
         xSemaphoreGive(db_mutex);
         return ESP_FAIL;
     }
-    
+
+    if (sample_mutex != NULL)
+    {
+        xSemaphoreTake(sample_mutex, portMAX_DELAY);
+    }
+
     // Clear the lookup table
     memset(param_lookup, 0, sizeof(param_lookup));
     param_count = 0;
-    
+
     // Populate the lookup table with all parameters
     while (sqlite3_step(stmt) == SQLITE_ROW && param_count < MAX_PARAMS)
     {
+        const char *data = (const char *)sqlite3_column_text(stmt, 3);
+
         param_lookup[param_count].id = sqlite3_column_int(stmt, 0);
         strncpy(param_lookup[param_count].name, (const char*)sqlite3_column_text(stmt, 1), sizeof(param_lookup[0].name) - 1);
         param_lookup[param_count].name[sizeof(param_lookup[0].name) - 1] = '\0'; // Ensure null termination
         strncpy(param_lookup[param_count].type, (const char*)sqlite3_column_text(stmt, 2), sizeof(param_lookup[0].type) - 1);
         param_lookup[param_count].type[sizeof(param_lookup[0].type) - 1] = '\0'; // Ensure null termination
-        
-        ESP_LOGI(TAG, "Loaded parameter: ID=%d, Name=%s, Type=%s", 
-                param_lookup[param_count].id, 
+        strncpy(param_lookup[param_count].data, data ? data : "", sizeof(param_lookup[0].data) - 1);
+        param_lookup[param_count].data[sizeof(param_lookup[0].data) - 1] = '\0';
+
+        ESP_LOGI(TAG, "Loaded parameter: ID=%d, Name=%s, Type=%s",
+                param_lookup[param_count].id,
                 param_lookup[param_count].name,
                 param_lookup[param_count].type);
-        
+
         param_count++;
     }
-    
+
+    if (sample_mutex != NULL)
+    {
+        xSemaphoreGive(sample_mutex);
+    }
+
     sqlite3_finalize(stmt);
     xSemaphoreGive(db_mutex);
     
@@ -506,72 +618,159 @@ esp_err_t obd_logger_init_params(const obd_param_entry_t *param_entries, size_t 
 }
 
 /**
- * @brief Store multiple parameters in the database only if their values have changed significantly
- * 
- * @param params Array of parameter name and value pairs
- * @param count Number of parameters to store
- * @return esp_err_t ESP_OK on success, ESP_FAIL on failure
+ * @brief Record one freshly acquired value into the RAM sample buffer
+ *
+ * Called from the acquisition path, so the sample carries the millisecond
+ * timestamp of the value itself rather than that of a later polling tick.
+ * Redundant samples are dropped here: at most one per parameter per configured
+ * sample spacing, and only when the value actually moved.
  */
-esp_err_t obd_logger_store_params(const param_value_t *params, size_t count)
+void obd_logger_record_sample(const char *name, float value)
 {
-    ESP_LOGI(TAG, "obd_logger_store_params called with %d parameters", count);
-    
-    if (db_file == NULL || count == 0) 
+    if (sample_buf == NULL || sample_mutex == NULL || name == NULL)
     {
-        ESP_LOGE(TAG, "Database not initialized or no parameters");
+        return;
+    }
+    if (!obd_logger_is_enabled())
+    {
+        return;
+    }
+
+    int64_t now_ms = obd_logger_now_ms();
+
+    xSemaphoreTake(sample_mutex, portMAX_DELAY);
+
+    param_lookup_t *entry = NULL;
+    int32_t entry_idx = -1;
+    for (int i = 0; i < param_count; i++)
+    {
+        if (strcmp(param_lookup[i].name, name) == 0)
+        {
+            entry = &param_lookup[i];
+            entry_idx = i;
+            break;
+        }
+    }
+
+    if (entry == NULL)
+    {
+        xSemaphoreGive(sample_mutex);
+        return; // not a logged parameter
+    }
+
+    if (entry->last_ts_ms != 0)
+    {
+        if (poll_period > 0 && (now_ms - entry->last_ts_ms) < (int64_t)poll_period)
+        {
+            xSemaphoreGive(sample_mutex);
+            return;
+        }
+        if (fabsf(value - entry->last_value) <= 0.001f)
+        {
+            xSemaphoreGive(sample_mutex);
+            return;
+        }
+    }
+
+    entry->last_value = value;
+    entry->last_ts_ms = now_ms;
+
+    if (sample_used < SAMPLE_BUF_ENTRIES)
+    {
+        sample_buf[sample_used].ts_ms = now_ms;
+        sample_buf[sample_used].param_idx = entry_idx;
+        sample_buf[sample_used].value = value;
+        sample_used++;
+    }
+    else
+    {
+        sample_dropped++;
+    }
+
+    xSemaphoreGive(sample_mutex);
+}
+
+/**
+ * @brief Number of samples currently waiting to be written
+ */
+static uint32_t obd_logger_pending_samples(void)
+{
+    uint32_t pending = 0;
+
+    if (sample_mutex == NULL)
+    {
+        return 0;
+    }
+    xSemaphoreTake(sample_mutex, portMAX_DELAY);
+    pending = sample_used;
+    xSemaphoreGive(sample_mutex);
+    return pending;
+}
+
+/**
+ * @brief Write every buffered sample to the database in one transaction
+ *
+ * Swaps the fill buffer out under sample_mutex and releases it before touching
+ * the card, so acquisition never blocks behind an SD write. Every row carries
+ * its own millisecond timestamp.
+ */
+static esp_err_t obd_logger_flush_samples(void)
+{
+    if (db_file == NULL || sample_buf == NULL)
+    {
         return ESP_FAIL;
     }
 
-    // First pass: count how many parameters have actually changed significantly
-    size_t changed_count = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (params[i].changed) {
-            changed_count++;
-        }
-    }
-    
-    if (changed_count == 0) {
-        ESP_LOGI(TAG, "No parameter values changed significantly (threshold: 0.001), skipping storage");
+    xSemaphoreTake(sample_mutex, portMAX_DELAY);
+    uint32_t count = sample_used;
+    uint32_t dropped = sample_dropped;
+    obd_sample_t *batch = sample_buf;
+    sample_buf = flush_buf;
+    flush_buf = batch;
+    sample_used = 0;
+    sample_dropped = 0;
+    xSemaphoreGive(sample_mutex);
+
+    if (count == 0)
+    {
         return ESP_OK;
     }
-    
-    ESP_LOGI(TAG, "%d out of %d parameters have changed significantly", changed_count, count);
+    if (dropped > 0)
+    {
+        ESP_LOGW(TAG, "Sample buffer overran: %"PRIu32" samples dropped", dropped);
+    }
 
     // Check if database rotation is needed before writing
     obd_db_manager_check_and_rotate();
 
-    if (xSemaphoreTake(db_mutex, portMAX_DELAY) != pdTRUE) 
+    if (xSemaphoreTake(db_mutex, portMAX_DELAY) != pdTRUE)
     {
         ESP_LOGE(TAG, "Failed to take mutex");
         return ESP_FAIL;
     }
-    
-    time_t unix_timestamp = rtcm_get_unix_timestamp();
-    
+
     int64_t start_time = esp_timer_get_time();
-    int total_stored = 0;
     int rc;
-    
+
     // Temporarily optimize SQLite for maximum performance during bulk insert
     sqlite3_exec(db_file, "PRAGMA synchronous = OFF;", NULL, NULL, NULL);
     sqlite3_exec(db_file, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL);
-    
-    // Begin transaction
+
     rc = sqlite3_exec(db_file, "BEGIN TRANSACTION;", NULL, NULL, NULL);
-    if (rc != SQLITE_OK) {
+    if (rc != SQLITE_OK)
+    {
         ESP_LOGE(TAG, "Failed to begin transaction: %s", sqlite3_errmsg(db_file));
         sqlite3_exec(db_file, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
         sqlite3_exec(db_file, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
         xSemaphoreGive(db_mutex);
         return ESP_FAIL;
     }
-    
-    // Prepare statement
+
     sqlite3_stmt *stmt;
     const char *sql = "INSERT INTO param_data (timestamp, param_id, value) VALUES (?, ?, ?);";
     rc = sqlite3_prepare_v2(db_file, sql, -1, &stmt, NULL);
-    
-    if (rc != SQLITE_OK) {
+    if (rc != SQLITE_OK)
+    {
         ESP_LOGE(TAG, "Failed to prepare statement: %s", sqlite3_errmsg(db_file));
         sqlite3_exec(db_file, "ROLLBACK;", NULL, NULL, NULL);
         sqlite3_exec(db_file, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
@@ -579,94 +778,51 @@ esp_err_t obd_logger_store_params(const param_value_t *params, size_t count)
         xSemaphoreGive(db_mutex);
         return ESP_FAIL;
     }
-    
-    // Pre-bind the timestamp (same for all rows)
-    sqlite3_bind_int64(stmt, 1, unix_timestamp);
-    
-    // Prepare for faster parameter lookup
-    // We'll build a simple lookup array only for significantly changed parameters
-    int *param_id_cache = malloc(count * sizeof(int));
-    if (!param_id_cache) {
-        sqlite3_finalize(stmt);
-        sqlite3_exec(db_file, "ROLLBACK;", NULL, NULL, NULL);
-        sqlite3_exec(db_file, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
-        sqlite3_exec(db_file, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
-        xSemaphoreGive(db_mutex);
-        return ESP_FAIL;
-    }
-    
-    // Pre-lookup all parameter IDs to avoid repeated string comparisons
-    for (size_t i = 0; i < count; i++) {
-        param_id_cache[i] = -1;
-        
-        // Only lookup parameters that have changed significantly
-        if (params[i].changed) {
-            for (int j = 0; j < param_count; j++) {
-                if (strcmp(param_lookup[j].name, params[i].name) == 0) {
-                    param_id_cache[i] = param_lookup[j].id;
-                    break;
-                }
-            }
-            
-            if (param_id_cache[i] == -1) {
-                ESP_LOGW(TAG, "Parameter '%s' not found in lookup table", params[i].name);
-            }
-        }
-    }
 
-    
-    // Insert only parameters that have changed significantly
-    for (size_t i = 0; i < count; i++) {
-
-        // Skip parameters that haven't changed or changed insignificantly
-        if (!params[i].changed) {
-            ESP_LOGD(TAG, "Skipping parameter '%s': changed flag is false", params[i].name);
+    uint32_t stored = 0;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        // Resolve the row id here, not at record time: a rotation between the two
+        // gives the parameter a new per-file id, and db_mutex (held here) is what
+        // serialises us against the rotation that renumbers them.
+        if (batch[i].param_idx < 0 || batch[i].param_idx >= param_count)
+        {
             continue;
         }
-        
-        if (param_id_cache[i] == -1) {
-            continue;  // Skip parameters not found in lookup table
+
+        sqlite3_bind_int64(stmt, 1, batch[i].ts_ms);
+        sqlite3_bind_int(stmt, 2, param_lookup[batch[i].param_idx].id);
+        sqlite3_bind_double(stmt, 3, batch[i].value);
+
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+        {
+            ESP_LOGW(TAG, "Failed to insert sample for param %s: %s",
+                     param_lookup[batch[i].param_idx].name, sqlite3_errmsg(db_file));
         }
-        
-        ESP_LOGD(TAG, "Storing parameter '%s': %.6f -> %.6f ", 
-                 params[i].name, params[i].old_value, params[i].value);
-        
-        // Bind parameter ID and value (timestamp is already bound)
-        sqlite3_bind_int(stmt, 2, param_id_cache[i]);
-        sqlite3_bind_double(stmt, 3, params[i].value);
-        
-        // Execute statement
-        rc = sqlite3_step(stmt);
-        if (rc != SQLITE_DONE) {
-            ESP_LOGW(TAG, "Failed to insert parameter '%s': %s", 
-                     params[i].name, sqlite3_errmsg(db_file));
-        } else {
-            total_stored++;
+        else
+        {
+            stored++;
         }
-        
-        // Reset statement for next parameter (but keep timestamp binding)
         sqlite3_reset(stmt);
     }
-    
-    // Clean up
+
     sqlite3_finalize(stmt);
-    free(param_id_cache);
-    
-    // Commit transaction
+
     rc = sqlite3_exec(db_file, "COMMIT;", NULL, NULL, NULL);
-    if (rc != SQLITE_OK) {
+    if (rc != SQLITE_OK)
+    {
         ESP_LOGE(TAG, "Failed to commit transaction: %s", sqlite3_errmsg(db_file));
         sqlite3_exec(db_file, "ROLLBACK;", NULL, NULL, NULL);
     }
-    
+
     // Restore normal SQLite settings
     sqlite3_exec(db_file, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
     sqlite3_exec(db_file, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
-    
+
     int64_t end_time = esp_timer_get_time();
-    ESP_LOGI(TAG, "Successfully stored %d significantly changed parameters out of %zu total in database. Storage time: %lld ms", 
-             total_stored, count, (end_time - start_time) / 1000);
-    
+    ESP_LOGI(TAG, "Flushed %"PRIu32"/%"PRIu32" samples in %lld ms",
+             stored, count, (end_time - start_time) / 1000);
+
     xSemaphoreGive(db_mutex);
     return ESP_OK;
 }
@@ -778,7 +934,7 @@ esp_err_t obd_logger_query_param(const char *param_name, const char *start_time,
     
     // Base query - convert timestamp to readable format in the query
     written = snprintf(query_ptr, remaining, 
-                     "SELECT datetime(timestamp, 'unixepoch') as DateTime, pd.value, pi.Name, pi.Type, pi.Data "
+                     "SELECT datetime(timestamp / 1000, 'unixepoch') as DateTime, pd.value, pi.Name, pi.Type, pi.Data "
                      "FROM param_data pd "
                      "JOIN param_info pi ON pd.param_id = pi.Id "
                      "WHERE pd.param_id = %d", param_id);
@@ -790,7 +946,7 @@ esp_err_t obd_logger_query_param(const char *param_name, const char *start_time,
         struct tm tm_start = {0};
         if (strptime(start_time, "%Y-%m-%d %H:%M:%S", &tm_start) != NULL) {
             time_t start_timestamp = mktime(&tm_start);
-            written = snprintf(query_ptr, remaining, " AND pd.timestamp >= %lld", (long long)start_timestamp);
+            written = snprintf(query_ptr, remaining, " AND pd.timestamp >= %lld", (long long)start_timestamp * 1000);
             query_ptr += written;
             remaining -= written;
         }
@@ -800,7 +956,7 @@ esp_err_t obd_logger_query_param(const char *param_name, const char *start_time,
         struct tm tm_end = {0};
         if (strptime(end_time, "%Y-%m-%d %H:%M:%S", &tm_end) != NULL) {
             time_t end_timestamp = mktime(&tm_end);
-            written = snprintf(query_ptr, remaining, " AND pd.timestamp <= %lld", (long long)end_timestamp);
+            written = snprintf(query_ptr, remaining, " AND pd.timestamp <= %lld", ((long long)end_timestamp * 1000) + 999);
             query_ptr += written;
             remaining -= written;
         }
@@ -891,7 +1047,7 @@ esp_err_t obd_logger_get_latest_time(char *datetime, size_t max_len)
     if (sqlite3_step(stmt) == SQLITE_ROW)
     {
         // Get the timestamp value
-        time_t unix_time = sqlite3_column_int64(stmt, 0);
+        time_t unix_time = (time_t)(sqlite3_column_int64(stmt, 0) / 1000); // stored in ms
         struct tm *timeinfo = localtime(&unix_time);
         
         // Format the time as a string
@@ -913,7 +1069,7 @@ esp_err_t obd_logger_get_latest_time(char *datetime, size_t max_len)
 static void obd_logger_task(void *pvParameters)
 {
     char db_time[32] = {0};
-    
+
     // Get the latest time from the database
     esp_err_t ret1 = obd_logger_get_latest_time(db_time, sizeof(db_time));
 
@@ -927,39 +1083,17 @@ static void obd_logger_task(void *pvParameters)
     if (obd_logger_get_total_entries(&entry_count) == ESP_OK) {
         ESP_LOGI(TAG, "Current database size: %lu entries", entry_count);
     }
-    
-    // Allocate arrays with proper string storage
-    param_value_t *param_values = heap_caps_malloc(sizeof(param_value_t) * obd_logger_params_count, MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
-    char (*param_names)[MAX_PARAMS] = heap_caps_malloc(sizeof(char[MAX_PARAMS]) * obd_logger_params_count, MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
-    if (param_values == NULL || param_names == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for parameters");
-        if (param_values) heap_caps_free(param_values);
-        if (param_names) heap_caps_free(param_names);
-        vTaskDelete(NULL);
-        return;
-    }else{
-        memset(param_values, 0, sizeof(param_value_t) * obd_logger_params_count);
-        memset(param_names, 0, sizeof(char[MAX_PARAMS]) * obd_logger_params_count);
-    }
-
-    for(int i = 0; i < obd_logger_params_count; i++)
-    {
-        param_values[i].changed = false;
-        param_values[i].old_value = FLT_MAX;
-    }
 
     obd_logger_set_initialized();
     obd_logger_enable();
 
-    // Forces the first poll's baseline values (old_value starts at FLT_MAX,
-    // so every param reads as "changed") to be written immediately.
-    int64_t last_write_us = 0;
+    int64_t last_flush_us = esp_timer_get_time();
 
     while (1)
     {
         // Wait for logging to be enabled or check current state
         if (obd_logger_event_group != NULL) {
-            EventBits_t bits = xEventGroupWaitBits(
+            xEventGroupWaitBits(
                 obd_logger_event_group,
                 OBD_LOGGER_ENABLED_BIT,
                 pdFALSE,        // Don't clear bits
@@ -967,104 +1101,27 @@ static void obd_logger_task(void *pvParameters)
                 portMAX_DELAY   // Wait indefinitely
             );
         }
-        
-        // Get parameters from callback function
-        if (obd_logger_get_params != NULL) {
-            char* params_json = obd_logger_get_params();
-            int64_t start_time = esp_timer_get_time();
-            if (params_json != NULL) {
-                ESP_LOGI(TAG, "Received parameters from callback: %s", params_json);
-                
-                // Parse the parameters from JSON and store them
-                cJSON *root = cJSON_Parse(params_json);
-                if (root != NULL) {
-                    
-                    if (param_values == NULL || param_names == NULL) {
-                        ESP_LOGE(TAG, "Failed to allocate memory for parameters");
-                        cJSON_Delete(root);
-                        free(params_json);
-                        continue;
-                    }
-                    
-                    int valid_params = 0;
-                    
-                    // Iterate through all JSON object members
-                    cJSON *element = root->child;
-                    while (element != NULL && valid_params < obd_logger_params_count) {
-                        if (element->string != NULL) {
-                            ESP_LOGD(TAG, "Processing JSON element: %s, type: %d", 
-                                    element->string, element->type);
-                            
-                            if (cJSON_IsNumber(element)) {
-                                // Copy the parameter name to avoid issues with pointers
-                                strncpy(param_names[valid_params], element->string, 49);
-                                param_names[valid_params][49] = '\0';
-                                param_values[valid_params].old_value = param_values[valid_params].value;
-                                param_values[valid_params].name = param_names[valid_params];
-                                param_values[valid_params].value = (float)element->valuedouble;
-                                
-                                ESP_LOGD(TAG, "Parsed parameter %d: %s = %f", 
-                                         valid_params,
-                                         param_values[valid_params].name, 
-                                         param_values[valid_params].value);
-                                
-                                valid_params++;
-                            }
-                        }
-                        element = element->next;
-                    }
-                    
-                    ESP_LOGI(TAG, "Total valid parameters parsed: %d", valid_params);
-                    
-                    if (valid_params > 0) {
 
-                        // Sticky "changed since last SD write" flag: a poll tick that finds no
-                        // change must not clear a dirty flag a previous poll tick already set.
-                        for (size_t i = 0; i < valid_params; i++) {
-                            float diff = fabsf(param_values[i].value - param_values[i].old_value);
-                            if (diff > 0.001f) {
-                                param_values[i].changed = true;
-                                ESP_LOGD(TAG, "Parameter %s changed: %.3f -> %.3f (diff: %.3f)",
-                                        param_values[i].name, param_values[i].old_value,
-                                        param_values[i].value, diff);
-                            }
-                        }
+        // Samples arrive from the acquisition path via obd_logger_record_sample();
+        // this task only decides when to put them on the card. Flushing early on
+        // the high-water mark keeps a fast sample rate from overrunning a slow
+        // write interval.
+        uint32_t write_period_ms = (logger_period > 0) ? (logger_period * 1000) : 10000;
+        uint32_t pending = obd_logger_pending_samples();
+        int64_t now_us = esp_timer_get_time();
 
-                        uint32_t write_period_ms = (logger_period > 0) ? (logger_period * 1000) : 10000;
-                        int64_t now_us = esp_timer_get_time();
-                        if ((now_us - last_write_us) >= (int64_t)write_period_ms * 1000)
-                        {
-                            esp_err_t result = obd_logger_store_params(param_values, valid_params);
-                            if (result != ESP_OK) {
-                                ESP_LOGE(TAG, "Failed to store parameters in database");
-                            }
-                            last_write_us = now_us;
-                            for (size_t i = 0; i < valid_params; i++) {
-                                param_values[i].changed = false;
-                            }
-                        }
-                    } else {
-                        ESP_LOGW(TAG, "No valid parameters found in JSON");
-                    }
-                    
-                    cJSON_Delete(root);
-                } else {
-                    ESP_LOGE(TAG, "Failed to parse parameters JSON");
-                }
-                
-                free(params_json);
+        if (pending > 0 &&
+            (((now_us - last_flush_us) >= (int64_t)write_period_ms * 1000) ||
+             pending >= SAMPLE_BUF_HIGH_WATER))
+        {
+            if (obd_logger_flush_samples() != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Failed to flush samples to database");
             }
-            
-            int64_t end_time = esp_timer_get_time();
-            ESP_LOGI("EX_TIME", "Parameters processing and storage time: %lld ms", (end_time - start_time) / 1000);
-        } else {
-            ESP_LOGW(TAG, "Parameter callback function is not set");
+            last_flush_us = now_us;
         }
-        
-        // Wait for the configured poll period (already milliseconds) before sampling
-        // again; the SD write itself is throttled separately above, by write_period_ms.
-        uint32_t poll_delay_ms = (poll_period > 0) ? poll_period : 1000;
-        vTaskDelay(pdMS_TO_TICKS(poll_delay_ms));
+
+        vTaskDelay(pdMS_TO_TICKS(FLUSH_CHECK_PERIOD_MS));
     }
 }
 
@@ -1094,13 +1151,16 @@ esp_err_t odb_logger_init(obd_logger_t *obd_logger)
         obd_logger_params_count = MAX_PARAMS;
     }
 
-    if(obd_logger->obd_logger_get_params_cb != NULL)
+    sample_mutex = xSemaphoreCreateMutex();
+    sample_buf = heap_caps_malloc(sizeof(obd_sample_t) * SAMPLE_BUF_ENTRIES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    flush_buf = heap_caps_malloc(sizeof(obd_sample_t) * SAMPLE_BUF_ENTRIES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (sample_mutex == NULL || sample_buf == NULL || flush_buf == NULL)
     {
-        obd_logger_get_params = obd_logger->obd_logger_get_params_cb;
-    }
-    else
-    {
-        ESP_LOGE(TAG, "Callback function not set");
+        ESP_LOGE(TAG, "Failed to allocate the sample buffers");
+        if (sample_buf) heap_caps_free(sample_buf);
+        if (flush_buf) heap_caps_free(flush_buf);
+        sample_buf = NULL;
+        flush_buf = NULL;
         return ESP_FAIL;
     }
 

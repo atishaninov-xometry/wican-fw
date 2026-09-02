@@ -61,10 +61,17 @@
 
 #define TEMP_BUFFER_LENGTH 32
 #define ECU_CONNECTED_BIT BIT0
+// Upper bound on the random de-correlation offset applied to a re-armed poll
+// timer. Capped at a quarter of the parameter's own period as well, so a 10ms
+// period isn't smeared by a +/-100ms offset (see autopid_rearm_param_timer).
 #define AUTOPID_POLL_JITTER_MS 100
 // Yield between sequential PID requests. Was a hard-coded 100ms; dropped to
 // 5ms to shrink the poll-cycle time (the cycle caps effective per-PID rate).
 #define AUTOPID_INTER_REQUEST_GAP_MS 5
+
+// Yield at the end of each poll pass. Kept short so the pass rate is set by the
+// PID periods and the gateway's own latency, not by this delay.
+#define AUTOPID_POLL_PASS_YIELD_MS 2
 
 // Max PIDs per batched Mode-01 request for Standard PIDs (see MIATA_ND3_NOTES.md).
 #define AUTOPID_STD_BATCH_MAX 6
@@ -174,8 +181,34 @@ static bool autopid_prepare_parameter_value(parameter_t *param,
     }
 
     *out_value = (float)rounded_value;
+
+    // Hand the sample to the logger here, at acquisition time, so the row it
+    // writes is stamped with when the value actually arrived. This is the single
+    // funnel every accepted value passes through (batched STD, per-PID STD,
+    // custom PIDs and CAN filters), so it is the only hook needed.
+    obd_logger_record_sample(param->name, *out_value);
+
     return true;
 }
+// Re-arm a parameter's poll timer for its next due time, with a small random
+// offset so parameters sharing a period don't all fall due on the same pass.
+static void autopid_rearm_param_timer(parameter_t *param)
+{
+    uint32_t jitter_ms = param->period / 4;
+
+    if (jitter_ms > AUTOPID_POLL_JITTER_MS)
+    {
+        jitter_ms = AUTOPID_POLL_JITTER_MS;
+    }
+
+    wc_timer_set(&param->timer, param->period);
+
+    if (jitter_ms > 0)
+    {
+        param->timer += ((int64_t)(esp_random() % ((jitter_ms * 2) + 1)) - (int64_t)jitter_ms) * 1000;
+    }
+}
+
 // strdup_psram
 static char *strdup_psram(const char *s)
 {
@@ -519,8 +552,7 @@ static void autopid_poll_std_pids_batched(pid_type_t *previous_pid_type)
             apply_count++;
         }
 
-        wc_timer_set(&param->timer, param->period);
-        param->timer += ((int64_t)(esp_random() % ((AUTOPID_POLL_JITTER_MS * 2) + 1)) - AUTOPID_POLL_JITTER_MS) * 1000;
+        autopid_rearm_param_timer(param);
     }
 
     if (batch_count == 0)
@@ -4308,8 +4340,7 @@ static void autopid_task(void *pvParameters)
 
                         ESP_LOGI(TAG, "Processing parameter: %s", param->name);
                         // Reset timer with parameter period
-                        wc_timer_set(&param->timer, param->period);
-                        param->timer += ((int64_t)(esp_random() % ((AUTOPID_POLL_JITTER_MS * 2) + 1)) - AUTOPID_POLL_JITTER_MS) * 1000;
+                        autopid_rearm_param_timer(param);
                         if (curr_pid->cmd != NULL && strlen(curr_pid->cmd) > 0)
                         {
                             // twai_message_t tx_msg;
@@ -4461,7 +4492,10 @@ static void autopid_task(void *pvParameters)
 
             // elm327_unlock();
             xSemaphoreGive(autopid_config->mutex);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            // Yield to other tasks between passes. This was 100ms, which put a
+            // hard ~10Hz ceiling on every PID regardless of its configured
+            // Period; the per-request gap above is what paces the ELM327.
+            vTaskDelay(pdMS_TO_TICKS(AUTOPID_POLL_PASS_YIELD_MS));
         }
 
         // CAN filters monitor window (broadcast frames)
@@ -4642,7 +4676,7 @@ static void autopid_init_obd_logger(uint32_t log_period, uint32_t log_poll_perio
     static obd_logger_t obd_logger = {
         .path = DB_ROOT_PATH "/" DB_DIR_NAME,
         .db_filename = DB_ROOT_PATH "/" DB_DIR_NAME "/" DB_DIR_NAME,
-        .obd_logger_get_params_cb = autopid_data_read};
+    };
     obd_logger.period_sec = log_period;
     obd_logger.poll_period_ms = log_poll_period;
     obd_logger.obd_logger_params = params;

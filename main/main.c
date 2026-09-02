@@ -972,7 +972,7 @@ void app_main(void)
 		if(config_server_get_log_poll_period(&log_poll_period) == -1)
 		{
 			ESP_LOGE(TAG, "error getting log poll period");
-			log_poll_period = 1000;
+			log_poll_period = 10;
 		}
 		autopid_init((char*)&uid[0], config_server_get_logger_config(), log_period, log_poll_period);
 	}

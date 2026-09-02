@@ -31,11 +31,14 @@ Ruled out: `log_period` was = 1 the whole time (user-confirmed); the std-PID Per
 
 **FIX = enable FEWER PIDs.** Cycle time ≈ (enabled PID count) × (~per-request round-trip on ND3). To get RPM/speed/throttle near ~1–2 s, enable ONLY those few and disable everything else (the slow-changing ones you set to 10 s, plus the NO-DATA `9D-EngineFuelRate`). True 1 Hz for a large PID set is not achievable at the OBD port — it's one sequential request/response on one CAN channel; only raw broadcast frames (internal bus tap, which ND3 doesn't expose at OBD) give many signals at high rate.
 
-To bring **brake** back, the firmware needs a header reset before each standard-PID poll (TODO, not done). Once fixed, re-add:
+**Brake is back (the header-reset TODO is done).** `autopid_poll_std_pids_batched()` now re-sends the 7DF header before *every* batch, so a 760 query can no longer wedge the standard PIDs for the rest of the drive — which is the only reason brake was dropped. It lives in `vehicle_profiles/mazda/nd3-mx5.json` as:
 ```json
-{ "pid": "222B0D1", "pid_init": "ATSH760;ATFCSH760;ATFCSD300000;ATFCSM1;", "parameters": { "Brake_Pressure": "[S4:S5]" } }
+{ "pid": "222B0D1", "pid_init": "ATSH760;ATFCSH760;ATFCSD300000;ATFCSM1;",
+  "parameters": [ { "name": "BrakePressure", "expression": "[S4:S5]", "min": 0, "period": 500 } ] }
 ```
-`Brake_Pressure` = raw signed pressure (real ~0–217; the 0x8000 no-reading sentinel reads as −32768 → filter negatives). The `/2.3` % conversion was dropped per request.
+`[S4:S5]` = raw signed pressure (mode22: A=B4, B=B5). Real range ~0–217; the 0x8000 no-reading sentinel reads as −32768, and `"min": 0` makes the firmware reject it outright (`autopid_prepare_parameter_value`) so no bogus row is ever logged. drewid74's reference gives the unit as **%** via `max(0, int16)/2.3` — that conversion is present as `BrakePressurePct` but `"enabled": false`, since raw was preferred here; flip the two `enabled` flags to swap.
+
+**Cost:** the 760 header means this entry can never join the 7DF batch (`autopid_batch_specific_is_eligible()` requires an absent-or-7DF init), so each poll costs its 4-command init plus the request — roughly 100–150 ms. At the default 500 ms period that is ~25% of the poll budget; going to 100 ms would saturate the loop and starve the batched PIDs.
 
 ## Steering — dead at the OBD port (confirmed)
 On-car test (2026-08-27): `22 2033` and `22 2034` **respond** (web-UI Test showed "Expression eval failed" = data arrived, not "NO DATA") but their values **never vary**; `22 201D` = constant `4`; `22 201F` = NO DATA. So the ND3 DSC does not expose live steering angle at the OBD port — it needs a behind-dash internal-bus tap. drewid74 saw the same (parked `760/20 20` cluster didn't vary).

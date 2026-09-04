@@ -679,17 +679,29 @@ static void autopid_poll_std_pids_batched(pid_type_t *previous_pid_type)
     cmd[cmd_len++] = '\r';
     cmd[cmd_len] = '\0';
 
-    // Resend the header for every batch, so a preceding custom/specific query
-    // that left it on another ECU can't wedge this request. standard_init only
-    // exists when the Standard PIDs tab has entries, so a profile-only setup
-    // falls back to the functional address the batched Mode-01 request needs.
-    const char *batch_init = "ATSH7DF\r";
-    if (autopid_config->standard_init && strlen(autopid_config->standard_init) > 0)
+    // Resend the header only when something may have changed it since the last
+    // batch. Every path that touches it leaves previous_pid_type != PID_STD: a
+    // custom/specific poll sets its own ATSH, the CAN-filter window rewrites
+    // ATCRA, and boot/resume start from PID_MAX. Between back-to-back batches
+    // the header is already right, and skipping it matters - each init is three
+    // blocking AT round trips (ATTP/ATSH/ATCRA), about as costly as the batched
+    // request itself, which was halving the achievable poll rate.
+    // (A header typed by hand in the web Terminal is outside this bookkeeping;
+    // the per-request response validation is what catches that.)
+    if (*previous_pid_type != PID_STD)
     {
-        batch_init = autopid_config->standard_init;
+        // standard_init only exists when the Standard PIDs tab has entries, so a
+        // profile-only setup falls back to the functional address a batched
+        // Mode-01 request needs.
+        const char *batch_init = "ATSH7DF\r";
+
+        if (autopid_config->standard_init && strlen(autopid_config->standard_init) > 0)
+        {
+            batch_init = autopid_config->standard_init;
+        }
+        ESP_LOGI(TAG, "Sending batch init: %s", batch_init);
+        send_commands((char *)batch_init, 2);
     }
-    ESP_LOGI(TAG, "Sending batch init: %s", batch_init);
-    send_commands((char *)batch_init, 2);
 
     *previous_pid_type = PID_STD;
 
@@ -4353,6 +4365,9 @@ static void autopid_task(void *pvParameters)
             ESP_LOGI(TAG, "Autopid enabled, resuming autopid task");
             obd_logger_enable();
             send_commands(default_init, 50);
+            // default_init doesn't necessarily set a header, so make the next
+            // batch re-establish it rather than trusting stale bookkeeping.
+            previous_pid_type = PID_MAX;
             vTaskDelay(pdMS_TO_TICKS(100));
         }
 

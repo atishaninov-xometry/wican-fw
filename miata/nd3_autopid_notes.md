@@ -36,7 +36,18 @@ Ruled out: `log_period` was = 1 the whole time (user-confirmed); the std-PID Per
 { "pid": "222B0D1", "pid_init": "ATSH760;ATFCSH760;ATFCSD300000;ATFCSM1;",
   "parameters": [ { "name": "BrakePressure", "expression": "[S4:S5]", "min": 0, "period": 500 } ] }
 ```
-`[S4:S5]` = raw signed pressure (mode22: A=B4, B=B5). Real range ~0–217; the 0x8000 no-reading sentinel reads as −32768, and `"min": 0` makes the firmware reject it outright (`autopid_prepare_parameter_value`) so no bogus row is ever logged. drewid74's reference gives the unit as **%** via `max(0, int16)/2.3` — that conversion is present as `BrakePressurePct` but `"enabled": false`, since raw was preferred here; flip the two `enabled` flags to swap.
+`[S4:S5]` = raw signed value (mode22: A=B4, B=B5). The 0x8000 no-reading sentinel reads as −32768, and `"min": 0` makes the firmware reject it outright (`autopid_prepare_parameter_value`) so no bogus row is ever logged.
+
+**⚠️ The unit is NOT established, and drewid74's `/2.3` "%" is wrong for this car.** That reference documents the signal as *"Brake position | 760 | 22 2B 0D | max(0, signed_int16(A,B))/2.3 | % | 0 → 0.43 (light tap)"* — its entire observed range is a light tap (raw ≈ 1), and it gives no physical calibration. On the 2026-09-04 log a maximum-effort press (stationary) reached **raw 282**, which `/2.3` turns into 122.6% — impossible, which is how the error surfaced.
+
+What the 2026-09-04 data does establish: **resolution is 1 raw/bit**, rest is exactly 0, and the trace behaves like a pedal (0 → 178 → 281, held at 263–282 with slow creep, released 204 → 183 → 82 → 0). Full-effort full scale ≈ 282.
+
+Candidate readings, none confirmed:
+- **Pedal position/effort, 0–282 full scale** → `/2.82` gives a clean 0–100%. Fits the reference's own name for the signal ("Brake position") and the fact that 282 came from maximum effort. Logged as `BrakePedalPct` (`enabled: false`).
+- **Hydraulic pressure at ~0.4–0.44 bar/bit** → max ≈ 113–123 bar, which is the right order for a hard stop, and would make the reference's light tap 0.43 **bar** rather than 0.43 %. Plausible but unverified.
+- **0.1 bar/bit** (a common OEM scale) → max only 28 bar, too low for maximum pedal effort; unlikely.
+
+So `BrakePressure` stays the **raw** value (the only thing actually measured) and no physical unit is claimed. Two caveats before trusting `/2.82`: 282 was measured **stationary**, so a rolling panic stop may exceed it and push the percentage past 100; and settling bar vs. percent needs an external reference (a line-pressure gauge, or correlating a rolling stop against IMU deceleration).
 
 **Cost:** the 760 header means this entry can never join the 7DF batch (`autopid_batch_specific_is_eligible()` requires an absent-or-7DF init), so each poll costs its 4-command init plus the request — roughly 100–150 ms. At the default 500 ms period that is ~25% of the poll budget; going to 100 ms would saturate the loop and starve the batched PIDs.
 

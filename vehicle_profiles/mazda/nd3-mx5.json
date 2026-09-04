@@ -206,8 +206,8 @@
                     "period": 500
                 },
                 {
-                    "name": "BrakePressurePct",
-                    "expression": "[S4:S5]/2.3",
+                    "name": "BrakePedalPct",
+                    "expression": "[S4:S5]/2.82",
                     "unit": "%",
                     "class": "none",
                     "min": 0,

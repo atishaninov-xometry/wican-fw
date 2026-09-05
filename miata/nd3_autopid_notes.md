@@ -31,25 +31,15 @@ Ruled out: `log_period` was = 1 the whole time (user-confirmed); the std-PID Per
 
 **FIX = enable FEWER PIDs.** Cycle time ≈ (enabled PID count) × (~per-request round-trip on ND3). To get RPM/speed/throttle near ~1–2 s, enable ONLY those few and disable everything else (the slow-changing ones you set to 10 s, plus the NO-DATA `9D-EngineFuelRate`). True 1 Hz for a large PID set is not achievable at the OBD port — it's one sequential request/response on one CAN channel; only raw broadcast frames (internal bus tap, which ND3 doesn't expose at OBD) give many signals at high rate.
 
-**Brake is back (the header-reset TODO is done).** `autopid_poll_std_pids_batched()` now re-sends the 7DF header before *every* batch, so a 760 query can no longer wedge the standard PIDs for the rest of the drive — which is the only reason brake was dropped. It lives in `vehicle_profiles/mazda/nd3-mx5.json` as:
+**Brake fluid pressure — 22 280A on 7E0, in kPa (identified 2026-09-04).** Car Scanner's "Mazda SkyActiv" profile shows *Brake Fluid Pressure* in kPa, reading ~8689 kPa at a very hard press. Source found: the [Mazda 3 PID list](https://gist.github.com/agronick/4d01cfe7f94dd41eeeb46f5e5dd204b8) documents **header `7E0`, identifier `22 28 0A`, bytes A,B, `(A*256+B)*100/128`, kPa**. The reading confirms it exactly: 8689.06 kPa requires raw **11122**, and 11122 × 100/128 = 8689.0625. Resolution is 100/128 = **0.78125 kPa/bit** (1/128 bar). Profile entry:
 ```json
-{ "pid": "222B0D1", "pid_init": "ATSH760;ATFCSH760;ATFCSD300000;ATFCSM1;",
-  "parameters": [ { "name": "BrakePressure", "expression": "[S4:S5]", "min": 0, "period": 500 } ] }
+{ "pid": "22280A1", "pid_init": "ATSH7E0;",
+  "parameters": [ { "name": "BrakePressure", "expression": "[B4:B5]*100/128",
+                    "unit": "kPa", "min": 0, "max": 20000, "period": 200 } ] }
 ```
-`[S4:S5]` = raw signed value (mode22: A=B4, B=B5). The 0x8000 no-reading sentinel reads as −32768, and `"min": 0` makes the firmware reject it outright (`autopid_prepare_parameter_value`) so no bogus row is ever logged.
+`max: 20000` filters garbage and the 0x8000 sentinel (which would read 25600 kPa); real full-effort pressure is ~8700 kPa (87 bar), so there is plenty of headroom. Note this is the **PCM (7E0)**, not the DSC — so no 760 header and no flow-control setup, just one `ATSH7E0`, which is why 200ms is affordable here.
 
-**⚠️ The unit is NOT established, and drewid74's `/2.3` "%" is wrong for this car.** That reference documents the signal as *"Brake position | 760 | 22 2B 0D | max(0, signed_int16(A,B))/2.3 | % | 0 → 0.43 (light tap)"* — its entire observed range is a light tap (raw ≈ 1), and it gives no physical calibration. On the 2026-09-04 log a maximum-effort press (stationary) reached **raw 282**, which `/2.3` turns into 122.6% — impossible, which is how the error surfaced.
-
-What the 2026-09-04 data does establish: **resolution is 1 raw/bit**, rest is exactly 0, and the trace behaves like a pedal (0 → 178 → 281, held at 263–282 with slow creep, released 204 → 183 → 82 → 0). Full-effort full scale ≈ 282.
-
-Candidate readings, none confirmed:
-- **Pedal position/effort, 0–282 full scale** → `/2.82` gives a clean 0–100%. Fits the reference's own name for the signal ("Brake position") and the fact that 282 came from maximum effort. Logged as `BrakePedalPct` (`enabled: false`).
-- **Hydraulic pressure at ~0.4–0.44 bar/bit** → max ≈ 113–123 bar, which is the right order for a hard stop, and would make the reference's light tap 0.43 **bar** rather than 0.43 %. Plausible but unverified.
-- **0.1 bar/bit** (a common OEM scale) → max only 28 bar, too low for maximum pedal effort; unlikely.
-
-So `BrakePressure` stays the **raw** value (the only thing actually measured) and no physical unit is claimed. Two caveats before trusting `/2.82`: 282 was measured **stationary**, so a rolling panic stop may exceed it and push the percentage past 100; and settling bar vs. percent needs an external reference (a line-pressure gauge, or correlating a rolling stop against IMU deceleration).
-
-**Cost:** the 760 header means this entry can never join the 7DF batch (`autopid_batch_specific_is_eligible()` requires an absent-or-7DF init), so each poll costs its 4-command init plus the request — roughly 100–150 ms. At the default 500 ms period that is ~25% of the poll budget; going to 100 ms would saturate the loop and starve the batched PIDs.
+**Superseded: `22 2B 0D` on 760.** That was the previous brake entry, and its unit was never established. drewid74's reference documents it as *"Brake position ... max(0, signed_int16(A,B))/2.3 | % | 0 → 0.43 (light tap)"* — an unexplained divisor fitted to a light tap, with no calibration. Our 2026-09-04 log reached raw **282** at maximum effort, which `/2.3` renders as 122.6% — impossible, which is how the error surfaced. It is a real signal (1 raw/bit, exact 0 at rest, clean pedal trace) but ~39x coarser than 280A and of unknown unit, so it was dropped in favour of the properly scaled PCM value. `git log` this file for the old entry if it's ever wanted.
 
 ## Steering — dead at the OBD port (confirmed)
 On-car test (2026-08-27): `22 2033` and `22 2034` **respond** (web-UI Test showed "Expression eval failed" = data arrived, not "NO DATA") but their values **never vary**; `22 201D` = constant `4`; `22 201F` = NO DATA. So the ND3 DSC does not expose live steering angle at the OBD port — it needs a behind-dash internal-bus tap. drewid74 saw the same (parked `760/20 20` cluster didn't vary).

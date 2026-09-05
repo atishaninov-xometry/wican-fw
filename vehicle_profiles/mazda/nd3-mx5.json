@@ -194,25 +194,17 @@
             ]
         },
         {
-            "pid": "222B0D1",
-            "pid_init": "ATSH760;ATFCSH760;ATFCSD300000;ATFCSM1;",
+            "pid": "22280A1",
+            "pid_init": "ATSH7E0;",
             "parameters": [
                 {
                     "name": "BrakePressure",
-                    "expression": "[S4:S5]",
-                    "unit": "raw",
-                    "class": "none",
+                    "expression": "[B4:B5]*100/128",
+                    "unit": "kPa",
+                    "class": "pressure",
                     "min": 0,
-                    "period": 500
-                },
-                {
-                    "name": "BrakePedalPct",
-                    "expression": "[S4:S5]/2.82",
-                    "unit": "%",
-                    "class": "none",
-                    "min": 0,
-                    "period": 500,
-                    "enabled": false
+                    "max": 20000,
+                    "period": 200
                 }
             ]
         }

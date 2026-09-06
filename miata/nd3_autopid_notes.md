@@ -64,29 +64,26 @@ mode01: A=B3, B=B4, C=B5, D=B6. mode22: A=B4, B=B5 (C=B6, D=B7).
 ## Gear decode
 Gear is in the **high nibble of byte B** → `÷16`. Verified from a real log: GearStatus raw ∈ {0,16,32,48,64}, RecommendedGear raw ∈ {0,32,48,64,80,96} = 16×gear. The Standard-tab "A4 gear RATIO" is noisy on ND3 — use this enum.
 
-## Fuel calibration (DONE — measured 2026-09-06 with a 10.0 L fill)
-`FuelLevel_L = B3*49/255`, `FuelEmpty_L = 45-(B3*49/255)`.
+## Fuel calibration (measured 2026-09-06 with a 10.0 L fill)
+`FuelLevel_L = B3*49/255`, `FuelEmpty_L = (255-B3)*49/255`. Derived from `obd_log_20260906_131801_000.db` alone, assuming B3 is linear in volume over 0..255.
 
-Measured, not assumed. A 10.0 L fill with the engine idling and the car stationary on both sides of it:
+The fill is cleanly bracketed: the car was stationary and idling before it, then a **complete 2m10s data gap** (13:21:40 -> 13:23:50 = key off, tank filled), then the engine restarted.
 
 | | raw B3 | `2F` % | litres @ 49/255 |
 |---|---|---|---|
-| before (settled, 13:21:01–13:21:40) | 176 | 69.02 | 33.8 |
-| after (13:23:54, engine restarted) | 228 | 89.41 | 43.8 |
-| Δ | **52** | 20.39 | **10.0** |
+| before — settled, held 13:21:21 -> 13:21:40 | 176 | 69.02 | 33.85 |
+| after — 13:23:54, 4s after restart | 228 | 89.41 | 43.85 |
+| Δ | **52** | 20.39 | **10.00** |
 
-So **0.1923 L per sender count**, i.e. byte 255 = **49.0 L** (±3.4 L from the quantisation below). The old `45/255` guess read that same fill as 9.18 L — 8.2% low.
+**52 counts = 10.0 L**, so **0.1923 L per count** and byte 255 = **49.04 L**. The old `45/255` guess read that same fill as 9.18 L — 8.2% low.
 
-Three things corroborate it:
-- The **highest B3 ever logged across every dump is 230** → 230 × 0.1923 = **44.2 L**, i.e. a physically full tank, against the ND's 45 L nominal spec. The sender's 0–255 range runs ~10% past the fill point, which is why a full tank reads ~90% and not 100%.
-- The fill therefore took the tank from 33.8 L to 43.8 L — essentially full, which is exactly what 10.0 L into a 44 L tank at that level should do, and explains why the value pins at 228–230 while driving afterwards.
-- Over the preceding 22-minute drive, `FuelRate` integrates to **0.59 L** = 3.1 counts, below the quantum at that level — and the level indeed did not move (median B3 = 176 in both sessions).
+**Why those two anchors.** Delta-logging writes a row only when the value changes, so the missing rows between 13:21:21 and key-off mean B3 sat at exactly 176 for the last ~19s of idling — it had converged (the approach was 182 -> 177 -> 176 -> 176 as the car sat still after stopping). Post-fill, 228 appears within 4s of restart and then **recurs as the ceiling** 5 times over the following 3.5 minutes (dips to 217/209/204 in between), so it is the settled level and the dips are slosh. Both anchors are good to about ±1 count, so Δ = 52 ±2 -> capacity **47.2 .. 51.0 L**.
 
-**Quantisation / why the uncertainty.** B3 only ever takes values off a lattice, and the step size *shrinks with level*: ~5 counts (≈0.96 L) mid-tank, 2–3 counts near full (215, 217, 219, 223, 226, 228, 230). That is the signature of a byte that is **linear in volume** with an underlying quantisation in float-arm *angle* — litres-per-degree is largest mid-tank and small once the arm is near its stop. (If B3 were linear in angle instead, the count step would be constant.) So the linear formula is the right shape; the residual error is ±2.5 counts on the "before" reading and ±1 on the "after", i.e. Δ = 52 ± 3.5 → full scale 46–53 L.
+**Do not use moving readings.** In the 70 seconds of driving before the stop, the same unchanged tank read anywhere from 138 to 194 (54.12% .. 76.08%). Only compare stationary, idling, settled values; on a moving car take the median, and near full take the maximum (slosh can then only read low).
 
-**Caveat:** the fill anchors the calibration over 33.8–43.8 L. Litres-per-count below half a tank is unverified. A second known fill from near-empty would pin the low end.
+**Caveat:** the fill anchors the scale over 33.85 .. 43.85 L. Linearity below half a tank is assumed, not measured — a second known fill from near-empty would confirm the low end.
 
-**Reading the number off a log:** `2F` is heavily damped — it held 176 for the entire idle before the fill and jumped straight to 228 on restart, and while driving it swings ±50 counts with slosh (one log ranged 103–228 on an unchanged tank). Only compare **stationary, engine-idling, settled** readings; on a moving car take the median, and near full take the maximum (slosh can then only read low).
+**Excluded from the calibration (per user, 2026-09-06):** earlier dumps and third-party app readings. For the record only, older logs reached B3 = 230; no capacity claim here rests on that.
 
 ## Source
 Validated ND3 PID reference: https://github.com/drewid74/2024-nd3-mazda-obdii (local copies: `ND3_drewid74_README.md`, `ND3_nd3_candidates.csv`, `nd3-pid-reference.md`).

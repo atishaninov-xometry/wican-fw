@@ -174,7 +174,7 @@
                 },
                 {
                     "name": "FuelEmpty_L",
-                    "expression": "45-(B3*49/255)",
+                    "expression": "(255-B3)*49/255",
                     "unit": "L",
                     "class": "none",
                     "min": 0,

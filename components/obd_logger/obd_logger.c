@@ -117,18 +117,153 @@ static obd_sample_t *flush_buf = NULL;    // swapped in at flush time
 static uint32_t sample_used = 0;
 static uint32_t sample_dropped = 0;
 
-// Wall-clock milliseconds. The system clock is set from the RTC at boot
-// (rtcm_sync_system_time_from_rtc), and gettimeofday() resolves to
-// microseconds off esp_timer, so this is precise between clock syncs.
-static int64_t obd_logger_now_ms(void)
+// Plausible range for a logged timestamp, epoch milliseconds: 2025-01-01 to
+// 2050-01-01. Outside it the clock is simply unset, and a row stamped from it
+// is worse than no row at all.
+#define OBD_LOGGER_TS_MIN_MS 1735689600000LL
+#define OBD_LOGGER_TS_MAX_MS 2524608000000LL
+
+// A wall clock that moves by more than this against the monotonic timer did not
+// tick there, it was set: the RTC is read at boot and SNTP corrects it once the
+// network comes up. Both sides of such a step can look plausible - a garbage
+// RTC read has been seen landing in 2033, which the window above happily
+// accepts - so what gives it away is the jump itself, not the value.
+#define OBD_LOGGER_CLOCK_STEP_MS 2000
+
+// Monotonic anchor for the wall clock, so a step can be told from elapsed time.
+// Both are guarded by sample_mutex.
+static int64_t clock_base_ms = 0;
+static int64_t clock_base_us = 0;
+// Milliseconds to add to the rows already written, to move them onto the
+// corrected epoch. Applied by the logger task, never from the acquisition path.
+static int64_t pending_ts_correction_ms = 0;
+
+// Wall-clock milliseconds, or 0 when the clock is not plausibly set.
+static int64_t obd_logger_wall_clock_ms(void)
 {
     struct timeval tv;
+    int64_t ms;
 
     if (gettimeofday(&tv, NULL) != 0)
     {
         return 0;
     }
-    return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
+
+    ms = (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
+    if (ms < OBD_LOGGER_TS_MIN_MS || ms > OBD_LOGGER_TS_MAX_MS)
+    {
+        return 0;
+    }
+    return ms;
+}
+
+/**
+ * @brief Timestamp for a sample, with any clock step folded in
+ *
+ * gettimeofday() resolves to microseconds off esp_timer, so it is precise
+ * between syncs; what it is not is continuous. On a step this rewrites the
+ * timestamps still buffered in RAM and queues the same correction for the rows
+ * already on the card, so one log file never ends up carrying two epochs.
+ * Rows in an already rotated file keep the epoch they were written on - the
+ * boot-time correction lands long before the first 4 MB rollover.
+ *
+ * Must be called with sample_mutex held. Returns 0 while the clock is unset.
+ */
+static int64_t obd_logger_now_ms(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    int64_t wall = obd_logger_wall_clock_ms();
+
+    if (wall == 0)
+    {
+        return 0;
+    }
+
+    if (clock_base_ms == 0)
+    {
+        clock_base_ms = wall;
+        clock_base_us = now_us;
+        return wall;
+    }
+
+    // Where the clock should be if it had only ticked since the last sample.
+    int64_t derived = clock_base_ms + (now_us - clock_base_us) / 1000;
+    int64_t step = wall - derived;
+
+    clock_base_ms = wall;
+    clock_base_us = now_us;
+
+    if (step > -OBD_LOGGER_CLOCK_STEP_MS && step < OBD_LOGGER_CLOCK_STEP_MS)
+    {
+        return wall;
+    }
+
+    ESP_LOGW(TAG, "System clock stepped by %lld ms; moving %"PRIu32" buffered samples "
+                  "and the rows already written onto the new epoch", step, sample_used);
+
+    for (uint32_t i = 0; i < sample_used; i++)
+    {
+        sample_buf[i].ts_ms += step;
+    }
+    for (int i = 0; i < param_count; i++)
+    {
+        if (param_lookup[i].last_ts_ms != 0)
+        {
+            param_lookup[i].last_ts_ms += step;
+        }
+    }
+    pending_ts_correction_ms += step;
+
+    return wall;
+}
+
+/**
+ * @brief Move the rows already on the card onto the corrected epoch
+ *
+ * Runs from the logger task ahead of any flush, which is what makes the blanket
+ * UPDATE right: every row in the table is still on the old epoch at that point,
+ * while the buffered samples were corrected in RAM when the step was seen.
+ */
+static void obd_logger_apply_ts_correction(void)
+{
+    int64_t correction;
+
+    if (sample_mutex == NULL || db_mutex == NULL || db_file == NULL)
+    {
+        return;
+    }
+
+    xSemaphoreTake(sample_mutex, portMAX_DELAY);
+    correction = pending_ts_correction_ms;
+    pending_ts_correction_ms = 0;
+    xSemaphoreGive(sample_mutex);
+
+    if (correction == 0)
+    {
+        return;
+    }
+
+    if (xSemaphoreTake(db_mutex, portMAX_DELAY) != pdTRUE)
+    {
+        return;
+    }
+
+    char sql[96];
+    char *err = NULL;
+
+    snprintf(sql, sizeof(sql), "UPDATE param_data SET timestamp = timestamp + %lld;", correction);
+    if (sqlite3_exec(db_file, sql, NULL, NULL, &err) != SQLITE_OK)
+    {
+        ESP_LOGE(TAG, "Failed to move stored timestamps by %lld ms: %s", correction,
+                 err ? err : "unknown error");
+        sqlite3_free(err);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Moved %d stored rows by %lld ms", sqlite3_changes(db_file), correction);
+    }
+
+    xSemaphoreGive(db_mutex);
 }
 
 /**
@@ -636,9 +771,26 @@ void obd_logger_record_sample(const char *name, float value)
         return;
     }
 
+    xSemaphoreTake(sample_mutex, portMAX_DELAY);
+
     int64_t now_ms = obd_logger_now_ms();
 
-    xSemaphoreTake(sample_mutex, portMAX_DELAY);
+    if (now_ms == 0)
+    {
+        xSemaphoreGive(sample_mutex);
+
+        // Clock not set - a row stamped from it would be worse than no row, so
+        // drop it and say so at a rate that can't spam the log.
+        static int64_t last_warn_us = 0;
+        int64_t now_us = esp_timer_get_time();
+
+        if ((now_us - last_warn_us) > 10000000)
+        {
+            ESP_LOGW(TAG, "Dropping samples: system clock is not plausibly set");
+            last_warn_us = now_us;
+        }
+        return;
+    }
 
     param_lookup_t *entry = NULL;
     int32_t entry_idx = -1;
@@ -1101,6 +1253,10 @@ static void obd_logger_task(void *pvParameters)
                 portMAX_DELAY   // Wait indefinitely
             );
         }
+
+        // A clock step leaves the rows already written on the old epoch; put
+        // them right before anything stamped on the new one goes down.
+        obd_logger_apply_ts_correction();
 
         // Samples arrive from the acquisition path via obd_logger_record_sample();
         // this task only decides when to put them on the card. Flushing early on

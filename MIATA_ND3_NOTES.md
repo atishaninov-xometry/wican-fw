@@ -51,7 +51,7 @@ Reassembled (First Frame + 2 Consecutive Frames, standard ISO-TP): `41 0C 0B1C 0
 - Byte index: mode01 A=B3,B=B4,C=B5,D=B6; mode22 A=B4,B=B5.
 
 ## Vehicle profile (separate project)
-The custom AutoPID profile + full decode notes live in the user's `miata-telemetry` project: `imports/nd3_wican_autopid.json` (7DF-only: FuelLevel_L/FuelEmpty_L @012F, GearStatus @01A4 B4/16, RecommendedGear @0165 B4/16) and `imports/nd3_autopid_notes.md`. Fuel: `FuelLevel_L=B3*45/255` (45 = assumed tank litres; recalibrate with a known fill vs `2F` %).
+The custom AutoPID profile + full decode notes live in the user's `miata-telemetry` project: `imports/nd3_wican_autopid.json` (7DF-only: FuelLevel_L/FuelEmpty_L @012F, GearStatus @01A4 B4/16, RecommendedGear @0165 B4/16) and `imports/nd3_autopid_notes.md`. Fuel: **calibrated 2026-09-06 with a 10.0 L fill** — `FuelLevel_L=B3*49/255` (0.1923 L per sender count; byte 255 = 49.0 L, and the highest B3 ever logged, 230, = 44.2 L ≈ the ND's 45 L nominal tank). The old `45/255` guess read that fill as 9.18 L. Full derivation, corroboration and the slosh/damping caveats in `miata/nd3_autopid_notes.md`.
 
 ## SD logging facts
 - AutoPID SD logger = SQLite under `/sdcard/obd_logs`, decoded PIDs only, **delta-logging** (only changed values), `synchronous=OFF` during inserts (nothing durable until checkpoint/unmount — hence the safe-eject/sleep-flush patches). Rollover at **4 MB/file**, keep newest **100** files (count-based only, no free-space guard). Param IDs are **per-file** (each rotated .db recreates `param_info`) — map through each file's own `param_info` when merging. `db_index.json` = the file manifest.

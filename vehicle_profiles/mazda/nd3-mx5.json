@@ -166,16 +166,18 @@
                 },
                 {
                     "name": "FuelLevel_L",
-                    "expression": "B3*45/255",
+                    "expression": "B3*49/255",
                     "unit": "L",
                     "class": "none",
+                    "min": 0,
                     "period": 10000
                 },
                 {
                     "name": "FuelEmpty_L",
-                    "expression": "45-(B3*45/255)",
+                    "expression": "45-(B3*49/255)",
                     "unit": "L",
                     "class": "none",
+                    "min": 0,
                     "period": 10000
                 }
             ]

@@ -10,7 +10,24 @@ document.addEventListener('DOMContentLoaded', async function() {
     let parameterMap = {};
     let chart = null;
     let loadedDatabases = {}; // Define loadedDatabases here at the top level
-    
+
+    // db.created/db.ended (from the firmware's db_index.json) are UTC but
+    // formatted with no milliseconds and no 'Z' suffix. moment's toISOString()
+    // produces UTC too, but WITH those, and comparing the two shapes with plain
+    // string <=/>= doesn't reliably sort by instant. Match the backend's exact
+    // format so the string comparisons below are apples-to-apples.
+    function toBackendUtcString(momentObj) {
+        return momentObj.clone().utc().format('YYYY-MM-DDTHH:mm:ss');
+    }
+
+    // Counterpart for parsing a db.created/db.ended value back into a real
+    // instant: a bare "YYYY-MM-DDTHH:mm:ss" (no zone) is UTC here, but the
+    // Date constructor treats a zone-less date-TIME string as local time, so
+    // without this it'd silently apply the browser's offset.
+    function parseBackendUtcString(str) {
+        return new Date(/[zZ]$/.test(str) ? str : str + 'Z');
+    }
+
     // Initialize date range picker
     $('#dateRange').daterangepicker({
         timePicker: true,
@@ -21,7 +38,7 @@ document.addEventListener('DOMContentLoaded', async function() {
             format: 'YYYY-MM-DD HH:mm'
         }
     }, function(start, end) {
-        fetchRelevantDatabases(start.toISOString(), end.toISOString());
+        fetchRelevantDatabases(toBackendUtcString(start), toBackendUtcString(end));
     });
     
     // Parameter search functionality
@@ -38,8 +55,8 @@ document.addEventListener('DOMContentLoaded', async function() {
     // Fetch initial relevant databases based on default date range
     const dateRangePicker = $('#dateRange').data('daterangepicker');
     if (dateRangePicker) {
-        const startDate = dateRangePicker.startDate.toISOString();
-        const endDate = dateRangePicker.endDate.toISOString();
+        const startDate = toBackendUtcString(dateRangePicker.startDate);
+        const endDate = toBackendUtcString(dateRangePicker.endDate);
         await fetchRelevantDatabases(startDate, endDate);
     }
 
@@ -137,7 +154,7 @@ document.addEventListener('DOMContentLoaded', async function() {
         }
         
         // Sort by creation date (newest first)
-        databasesToLoad.sort((a, b) => new Date(b.created) - new Date(a.created));
+        databasesToLoad.sort((a, b) => parseBackendUtcString(b.created) - parseBackendUtcString(a.created));
         
         console.log(`Loading ${databasesToLoad.length} databases for the selected time period:`, 
                     databasesToLoad.map(db => db.filename).join(', '));
@@ -550,9 +567,9 @@ async function updateChart() {
      * Combine data from multiple databases
      */
     async function combineMultipleDatabases() {
-        const startDate = $('#dateRange').data('daterangepicker').startDate.toISOString();
-        const endDate = $('#dateRange').data('daterangepicker').endDate.toISOString();
-        
+        const startDate = toBackendUtcString($('#dateRange').data('daterangepicker').startDate);
+        const endDate = toBackendUtcString($('#dateRange').data('daterangepicker').endDate);
+
         const relevantDbs = dbIndex.databases.filter(db => {
             return db.created <= endDate && (db.ended >= startDate || !db.ended);
         });

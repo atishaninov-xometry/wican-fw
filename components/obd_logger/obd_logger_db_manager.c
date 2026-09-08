@@ -453,9 +453,13 @@ esp_err_t obd_db_manager_cleanup_old_files(void)
             snprintf(file_path, sizeof(file_path)+2, "%s/%s", 
                     db_manager.config.base_path, db_files[i].filename);
             
-            ESP_LOGI(TAG, "Deleting old DB file: %s (created: %s, size: %"PRIu32" bytes)", 
-                    db_files[i].filename, 
-                    ctime(&db_files[i].created_time), // Note: ctime adds a newline
+            char created_str[32];
+            struct tm created_tm;
+            gmtime_r(&db_files[i].created_time, &created_tm);
+            strftime(created_str, sizeof(created_str), "%Y-%m-%dT%H:%M:%SZ", &created_tm);
+            ESP_LOGI(TAG, "Deleting old DB file: %s (created: %s, size: %"PRIu32" bytes)",
+                    db_files[i].filename,
+                    created_str,
                     db_files[i].size_bytes);
             
             if (delete_file(file_path) != ESP_OK) {
@@ -710,7 +714,7 @@ static esp_err_t update_json_index(void)
         if (extract_timestamp_from_filename(db_files[i].filename, time_str, sizeof(time_str)) != ESP_OK) {
             // If extraction fails, try to use the file's modified time as fallback
             time_t file_time = db_files[i].created_time;
-            struct tm *timeinfo = localtime(&file_time);
+            struct tm *timeinfo = gmtime(&file_time);
             if (timeinfo) {
                 strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", timeinfo);
             } else {
@@ -742,7 +746,7 @@ static esp_err_t update_json_index(void)
                 } else {
                     // Fallback to next file's creation timestamp
                     time_t ended_time = db_files[i+1].created_time;
-                    struct tm *timeinfo = localtime(&ended_time);
+                    struct tm *timeinfo = gmtime(&ended_time);
                     if (timeinfo) {
                         strftime(ended_time_str, sizeof(ended_time_str), "%Y-%m-%dT%H:%M:%S", timeinfo);
                         cJSON_AddStringToObject(db_item, "ended", ended_time_str);
@@ -954,7 +958,7 @@ static void generate_db_filename(char *filename, size_t max_len)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to get time from RTCM, using system time");
         time_t now = time(NULL);
-        struct tm *timeinfo = localtime(&now);
+        struct tm *timeinfo = gmtime(&now);
         
         snprintf(filename, max_len, "%s%04d%02d%02d_%02d%02d%02d_%03lu%s",
                 DB_FILENAME_PREFIX,
@@ -969,7 +973,7 @@ static void generate_db_filename(char *filename, size_t max_len)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to get date from RTCM, using system time");
         time_t now = time(NULL);
-        struct tm *timeinfo = localtime(&now);
+        struct tm *timeinfo = gmtime(&now);
         
         snprintf(filename, max_len, "%s%04d%02d%02d_%02d%02d%02d_%03lu%s",
                 DB_FILENAME_PREFIX,

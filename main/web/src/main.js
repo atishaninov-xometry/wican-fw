@@ -1,4 +1,27 @@
-async function checkFirmwareUpdate() {
+function showFirmwareUpdateNotice(latestVersion, url) {
+        const notice = document.getElementById('firmware-update-notice');
+        if (!notice) return;
+        const versionText = ` <span style='color:#b45309'>(v${latestVersion})</span>`;
+        notice.innerHTML = `<span style=\"font-weight: 600;\">New firmware available!</span><br><a id=\"firmware-update-link\" href=\"${url}\" target=\"_blank\" style=\"color: #2563eb; text-decoration: underline;\">Download</a>${versionText}`;
+        notice.style.display = 'block';
+    }
+    // Tries the device's own station link first (works standalone, e.g. parked
+    // with no phone in range); if that has no real internet, falls back to
+    // checking GitHub from the browser instead (e.g. over the phone's cellular
+    // data).
+    async function checkFirmwareUpdate() {
+        try {
+            const response = await fetch('/firmware_check_device');
+            if (!response.ok) { checkFirmwareUpdateViaBrowser(); return; }
+            const result = await response.json();
+            if (result.update_available) {
+                showFirmwareUpdateNotice(result.latest_version, result.url);
+            }
+        } catch (e) {
+            checkFirmwareUpdateViaBrowser();
+        }
+    }
+    async function checkFirmwareUpdateViaBrowser() {
         try {
             const currentRaw = document.getElementById('fw_version')?.textContent?.trim();
             if (!currentRaw) return;
@@ -40,13 +63,8 @@ async function checkFirmwareUpdate() {
 
             // Only notify if latest > current
             if (cmpVersions(latestVersion, currentVersion) === 1) {
-                const notice = document.getElementById('firmware-update-notice');
-                if (notice) {
-                    const url = proRelease.html_url || 'https://github.com/meatpiHQ/wican-fw/releases';
-                    const versionText = ` <span style='color:#b45309'>(v${latestVersion})</span>`;
-                    notice.innerHTML = `<span style=\"font-weight: 600;\">New firmware available!</span><br><a id=\"firmware-update-link\" href=\"${url}\" target=\"_blank\" style=\"color: #2563eb; text-decoration: underline;\">Download</a>${versionText}`;
-                    notice.style.display = 'block';
-                }
+                const url = proRelease.html_url || 'https://github.com/meatpiHQ/wican-fw/releases';
+                showFirmwareUpdateNotice(latestVersion, url);
             }
         } catch (e) {
             // Silent fail to avoid impacting UI if GitHub is unreachable
@@ -210,15 +228,24 @@ async function checkFirmwareUpdate() {
 
     async function fetchVehicleProfiles() {
         try {
-            if (!navigator.onLine) {
-                throw new Error('No internet connection');
+            // Try the device's own station link first (works standalone, e.g.
+            // parked with no phone in range); if that has no real internet,
+            // fall back to fetching it in the browser (e.g. over the phone's
+            // cellular data), same URL and format either way.
+            let data;
+            const deviceResponse = await fetch('/vehicle_profiles_device').catch(() => null);
+            if (deviceResponse && deviceResponse.ok) {
+                data = await deviceResponse.json();
+            } else {
+                if (!navigator.onLine) {
+                    throw new Error('No internet connection');
+                }
+                const response = await fetch('https://raw.githubusercontent.com/meatpiHQ/wican-fw/main/vehicle_profiles.json');
+                if (!response.ok) {
+                    throw new Error('Network response was not ok');
+                }
+                data = await response.json();
             }
-            
-            const response = await fetch('https://raw.githubusercontent.com/meatpiHQ/wican-fw/main/vehicle_profiles.json');
-            if (!response.ok) {
-                throw new Error('Network response was not ok');
-            }
-            const data = await response.json();
             console.log(data);
             latest_car_models = data;
             const carModels = [];

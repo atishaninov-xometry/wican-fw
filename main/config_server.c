@@ -40,14 +40,15 @@
 #include "esp_err.h"
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include "ff.h"
 #include "filesystem.h"
-#if USE_FATFS	
+#if USE_FATFS
 #include "esp_vfs_fat.h"
-#endif	
+#endif
 
 #include "esp_vfs.h"
 #include "config_server.h"
@@ -814,8 +815,12 @@ static esp_err_t get_uri_handler(httpd_req_t *req)
 							ESP_LOGE(TAG, "Failed to open downloaded file: %s", file->fs_path);
 						}
 					} else {
-						ESP_LOGE(TAG, "Failed to download file: %s, error: %s", 
+						ESP_LOGW(TAG, "Failed to download file: %s, error: %s -- redirecting client to fetch it directly",
 								file->download_uri, esp_err_to_name(ret));
+						httpd_resp_set_status(req, "302 Found");
+						httpd_resp_set_hdr(req, "Location", file->download_uri);
+						httpd_resp_send(req, NULL, 0);
+						return ESP_OK;
 					}
 				}				
             }
@@ -2359,6 +2364,333 @@ static esp_err_t std_pid_info_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* --- Manual clock set (no NTP needed) ---
+ * POST /set_time  body {"epoch": <utc-seconds>}  -> sets RX8130 RTC + system clock.
+ * GET  /get_time  -> {"epoch": <utc-seconds>} of the device's current clock.
+ * Used by the web UI "Set time" / "Borrow browser time" buttons. */
+static esp_err_t set_time_handler(httpd_req_t *req)
+{
+    char buf[128];
+    int total = req->content_len;
+    if (total <= 0 || total >= (int)sizeof(buf))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");
+        return ESP_FAIL;
+    }
+    int received = 0;
+    while (received < total)
+    {
+        int r = httpd_req_recv(req, buf + received, total - received);
+        if (r <= 0)
+        {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+            return ESP_FAIL;
+        }
+        received += r;
+    }
+    buf[received] = '\0';
+
+    time_t epoch = 0;
+    cJSON *root = cJSON_Parse(buf);
+    if (root)
+    {
+        cJSON *e = cJSON_GetObjectItem(root, "epoch");
+        if (cJSON_IsNumber(e))
+        {
+            epoch = (time_t)e->valuedouble;   /* seconds since 1970 UTC */
+        }
+        cJSON_Delete(root);
+    }
+
+    if (epoch < 1700000000)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing/implausible epoch");
+        return ESP_FAIL;
+    }
+
+    if (rtcm_set_from_unix(epoch) != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "RTC set failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static esp_err_t get_time_handler(httpd_req_t *req)
+{
+    char out[64];
+    time_t now = time(NULL);
+    snprintf(out, sizeof(out), "{\"epoch\":%lld}", (long long)now);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    return ESP_OK;
+}
+
+/* Internet time sync, attempted device-side first (see the equivalent
+ * client-side fallback in homepage.html's syncInternetTime()): if the
+ * station link has no real internet (not associated, no route, DNS/TLS
+ * failure...), this fails fast and the browser does the fetch itself
+ * instead, e.g. over the phone's cellular data. Same data source
+ * (timeapi.io) and fields as the browser-side path, for consistency. */
+static esp_err_t sync_time_device_handler(httpd_req_t *req)
+{
+    if (https_client_mgr_init() != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "HTTPS client unavailable");
+        return ESP_FAIL;
+    }
+
+    https_client_mgr_response_t resp = {0};
+    esp_err_t ret = https_client_mgr_get(
+        "https://timeapi.io/api/time/current/zone?timeZone=Etc/UTC", &resp);
+    https_client_mgr_deinit();
+
+    if (ret != ESP_OK || !resp.is_success || resp.data == NULL)
+    {
+        ESP_LOGW(TAG, "Device-side time sync unavailable (%s) -- client should fetch it itself",
+                 esp_err_to_name(ret));
+        https_client_mgr_free_response(&resp);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No internet on station link");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(resp.data);
+    if (root == NULL)
+    {
+        https_client_mgr_free_response(&resp);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Bad response from time source");
+        return ESP_FAIL;
+    }
+    https_client_mgr_free_response(&resp);
+
+    cJSON *year = cJSON_GetObjectItem(root, "year");
+    cJSON *month = cJSON_GetObjectItem(root, "month");
+    cJSON *day = cJSON_GetObjectItem(root, "day");
+    cJSON *hour = cJSON_GetObjectItem(root, "hour");
+    cJSON *minute = cJSON_GetObjectItem(root, "minute");
+    cJSON *seconds = cJSON_GetObjectItem(root, "seconds");
+    if (!cJSON_IsNumber(year) || !cJSON_IsNumber(month) || !cJSON_IsNumber(day) ||
+        !cJSON_IsNumber(hour) || !cJSON_IsNumber(minute) || !cJSON_IsNumber(seconds))
+    {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Unexpected time API response");
+        return ESP_FAIL;
+    }
+
+    struct tm tm_utc = {0};
+    tm_utc.tm_year = year->valueint - 1900;
+    tm_utc.tm_mon  = month->valueint - 1;
+    tm_utc.tm_mday = day->valueint;
+    tm_utc.tm_hour = hour->valueint;
+    tm_utc.tm_min  = minute->valueint;
+    tm_utc.tm_sec  = seconds->valueint;
+    cJSON_Delete(root);
+
+    time_t epoch = rtcm_timegm(&tm_utc);
+    if (epoch < 1700000000 || rtcm_set_from_unix(epoch) != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "RTC set failed");
+        return ESP_FAIL;
+    }
+
+    char out[64];
+    snprintf(out, sizeof(out), "{\"status\":\"ok\",\"epoch\":%lld}", (long long)epoch);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    return ESP_OK;
+}
+
+/* Vehicle profiles list, attempted device-side first (see the client-side
+ * fallback in fetchVehicleProfiles() in main.js): same URL and raw JSON
+ * either way, just proxied through the device when its station link has
+ * real internet, so it works without a phone in range. */
+static esp_err_t vehicle_profiles_device_handler(httpd_req_t *req)
+{
+    if (https_client_mgr_init() != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "HTTPS client unavailable");
+        return ESP_FAIL;
+    }
+
+    https_client_mgr_response_t resp = {0};
+    esp_err_t ret = https_client_mgr_get(
+        "https://raw.githubusercontent.com/meatpiHQ/wican-fw/main/vehicle_profiles.json", &resp);
+    https_client_mgr_deinit();
+
+    if (ret != ESP_OK || !resp.is_success || resp.data == NULL)
+    {
+        ESP_LOGW(TAG, "Device-side vehicle_profiles.json fetch unavailable (%s) -- client should fetch it itself",
+                 esp_err_to_name(ret));
+        https_client_mgr_free_response(&resp);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No internet on station link");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp.data, resp.data_len);
+    https_client_mgr_free_response(&resp);
+    return ESP_OK;
+}
+
+/* Pulls the leading N(.N(.N)) out of a version-ish string (a release tag
+ * like "v4.51p", or this build's own "major.minor" from app_desc->version),
+ * matching the same lenient extraction the browser-side check already does. */
+static void extract_version_numbers(const char *str, int *major, int *minor, int *patch)
+{
+    *major = *minor = *patch = 0;
+    if (str == NULL) return;
+
+    while (*str && !isdigit((unsigned char)*str)) str++;
+    if (!*str) return;
+
+    *major = (int)strtol(str, (char **)&str, 10);
+    if (*str == '.')
+    {
+        str++;
+        *minor = (int)strtol(str, (char **)&str, 10);
+        if (*str == '.')
+        {
+            str++;
+            *patch = (int)strtol(str, (char **)&str, 10);
+        }
+    }
+}
+
+/* Firmware update check, attempted device-side first (see the client-side
+ * fallback in checkFirmwareUpdate() in main.js): same GitHub API and "PRO"
+ * release matching either way, just done server-side when the station link
+ * has real internet, so it works without a phone in range. */
+static esp_err_t firmware_check_device_handler(httpd_req_t *req)
+{
+    if (https_client_mgr_init() != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "HTTPS client unavailable");
+        return ESP_FAIL;
+    }
+
+    https_client_mgr_response_t resp = {0};
+    // GitHub's API requires a User-Agent header or it rejects the request.
+    const char *headers[] = { "User-Agent: wican-fw", NULL };
+    https_client_mgr_config_t cfg = {
+        .url = "https://api.github.com/repos/meatpiHQ/wican-fw/releases",
+        .use_crt_bundle = true,
+        .timeout_ms = 8000,
+    };
+    esp_err_t ret = https_client_mgr_request(&cfg, HTTPS_METHOD_GET, NULL, 0, headers, &resp);
+    https_client_mgr_deinit();
+
+    if (ret != ESP_OK || !resp.is_success || resp.data == NULL)
+    {
+        ESP_LOGW(TAG, "Device-side firmware check unavailable (%s) -- client should check it itself",
+                 esp_err_to_name(ret));
+        https_client_mgr_free_response(&resp);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No internet on station link");
+        return ESP_FAIL;
+    }
+
+    cJSON *releases = cJSON_Parse(resp.data);
+    if (releases == NULL || !cJSON_IsArray(releases))
+    {
+        if (releases) cJSON_Delete(releases);
+        https_client_mgr_free_response(&resp);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Bad response from GitHub");
+        return ESP_FAIL;
+    }
+    https_client_mgr_free_response(&resp);
+
+    const char *latest_tag = NULL;
+    const char *latest_url = NULL;
+    cJSON *rel;
+    cJSON_ArrayForEach(rel, releases)
+    {
+        cJSON *name = cJSON_GetObjectItem(rel, "name");
+        cJSON *tag = cJSON_GetObjectItem(rel, "tag_name");
+        bool name_has_pro = cJSON_IsString(name) && strcasestr(name->valuestring, "PRO") != NULL;
+        bool tag_has_p = cJSON_IsString(tag) && strchr(tag->valuestring, 'P') != NULL;
+        if (name_has_pro || tag_has_p)
+        {
+            cJSON *url = cJSON_GetObjectItem(rel, "html_url");
+            latest_tag = cJSON_IsString(tag) ? tag->valuestring
+                       : (cJSON_IsString(name) ? name->valuestring : NULL);
+            latest_url = cJSON_IsString(url) ? url->valuestring : NULL;
+            break;
+        }
+    }
+
+    if (latest_tag == NULL)
+    {
+        cJSON_Delete(releases);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"update_available\":false}");
+        return ESP_OK;
+    }
+
+    int cur_major, cur_minor, cur_patch;
+    int latest_major, latest_minor, latest_patch;
+    esp_app_desc_t *running_app_info = dev_status_get_running_app_info();
+    extract_version_numbers(running_app_info->version, &cur_major, &cur_minor, &cur_patch);
+    extract_version_numbers(latest_tag, &latest_major, &latest_minor, &latest_patch);
+
+    bool update_available =
+        (latest_major != cur_major) ? (latest_major > cur_major) :
+        (latest_minor != cur_minor) ? (latest_minor > cur_minor) :
+        (latest_patch > cur_patch);
+
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddBoolToObject(out, "update_available", update_available);
+    cJSON_AddStringToObject(out, "latest_version", latest_tag);
+    cJSON_AddStringToObject(out, "url", latest_url ? latest_url : "https://github.com/meatpiHQ/wican-fw/releases");
+    char *out_str = cJSON_PrintUnformatted(out);
+    cJSON_Delete(out);
+    cJSON_Delete(releases);
+
+    if (out_str == NULL)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to build response");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out_str);
+    free(out_str);
+    return ESP_OK;
+}
+
+static const httpd_uri_t firmware_check_device_uri = {
+    .uri       = "/firmware_check_device",
+    .method    = HTTP_GET,
+    .handler   = firmware_check_device_handler,
+    .user_ctx  = NULL
+};
+
+static const httpd_uri_t vehicle_profiles_device_uri = {
+    .uri       = "/vehicle_profiles_device",
+    .method    = HTTP_GET,
+    .handler   = vehicle_profiles_device_handler,
+    .user_ctx  = NULL
+};
+
+static const httpd_uri_t set_time_uri = {
+    .uri       = "/set_time",
+    .method    = HTTP_POST,
+    .handler   = set_time_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t get_time_uri = {
+    .uri       = "/get_time",
+    .method    = HTTP_GET,
+    .handler   = get_time_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t sync_time_device_uri = {
+    .uri       = "/sync_time_device",
+    .method    = HTTP_POST,
+    .handler   = sync_time_device_handler,
+    .user_ctx  = NULL
+};
+
 static const httpd_uri_t index_uri = {
     .uri       = "/",
     .method    = HTTP_GET,
@@ -3561,6 +3893,11 @@ static void register_server_uris(void)
 	ESP_LOGI(TAG, "Registering URI handlers");
 	httpd_register_uri_handler(server, &index_uri);
 	httpd_register_uri_handler(server, &store_config_uri);
+	httpd_register_uri_handler(server, &set_time_uri);
+	httpd_register_uri_handler(server, &get_time_uri);
+	httpd_register_uri_handler(server, &sync_time_device_uri);
+	httpd_register_uri_handler(server, &vehicle_profiles_device_uri);
+	httpd_register_uri_handler(server, &firmware_check_device_uri);
 	httpd_register_uri_handler(server, &check_status_uri);
 	httpd_register_uri_handler(server, &load_config_uri);
 	httpd_register_uri_handler(server, &logo_uri);
@@ -3745,7 +4082,9 @@ static httpd_handle_t config_server_init(void)
                        );
 
 	// Start the httpd server (reserve extra slots for cert manager endpoints)
-	config.max_uri_handlers = 38;
+	// bumped 38->48: the table was tuned to fit exactly, and overflowing it silently
+	// drops the last-registered handler (the wildcard static one -> all JS 404s)
+	config.max_uri_handlers = 48;
 	config.stack_size = (10*1024);
 	config.max_open_sockets = 15;
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);

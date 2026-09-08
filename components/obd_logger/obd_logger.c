@@ -137,6 +137,12 @@ static int64_t clock_base_us = 0;
 // Milliseconds to add to the rows already written, to move them onto the
 // corrected epoch. Applied by the logger task, never from the acquisition path.
 static int64_t pending_ts_correction_ms = 0;
+// First param_data rowid this session wrote. Rows below it were written before
+// the file was opened - by an earlier boot, since obd_db_manager_init() reuses
+// whatever db_index.json still points at, and at a 128MB rotation limit that
+// file can hold weeks of already-correct rows - so a clock correction must
+// never touch them. Guarded by db_mutex.
+static int64_t session_first_rowid = 1;
 
 // Wall-clock milliseconds, or 0 when the clock is not plausibly set.
 static int64_t obd_logger_wall_clock_ms(void)
@@ -248,10 +254,17 @@ static void obd_logger_apply_ts_correction(void)
         return;
     }
 
-    char sql[96];
+    char sql[160];
     char *err = NULL;
 
-    snprintf(sql, sizeof(sql), "UPDATE param_data SET timestamp = timestamp + %lld;", correction);
+    // rowid >= session_first_rowid is what keeps this to rows this session
+    // wrote. Without it the correction would also shift every correctly
+    // stamped row an earlier boot left in the same file, and would rewrite the
+    // whole table (up to ~5M rows at the 128MB rotation limit) while holding
+    // db_mutex.
+    snprintf(sql, sizeof(sql),
+             "UPDATE param_data SET timestamp = timestamp + %lld WHERE rowid >= %lld;",
+             correction, session_first_rowid);
     if (sqlite3_exec(db_file, sql, NULL, NULL, &err) != SQLITE_OK)
     {
         ESP_LOGE(TAG, "Failed to move stored timestamps by %lld ms: %s", correction,
@@ -260,10 +273,69 @@ static void obd_logger_apply_ts_correction(void)
     }
     else
     {
-        ESP_LOGW(TAG, "Moved %d stored rows by %lld ms", sqlite3_changes(db_file), correction);
+        ESP_LOGW(TAG, "Moved %d stored rows (rowid >= %lld) by %lld ms",
+                 sqlite3_changes(db_file), session_first_rowid, correction);
     }
 
     xSemaphoreGive(db_mutex);
+}
+
+/**
+ * @brief Drop a queued correction whose rows are no longer reachable
+ *
+ * Called from the logger task with db_mutex held. It takes sample_mutex only
+ * briefly and never across database work, and no path anywhere takes db_mutex
+ * while holding sample_mutex, so this nesting cannot cycle.
+ */
+static void obd_logger_discard_ts_correction(void)
+{
+    int64_t dropped;
+
+    if (sample_mutex == NULL)
+    {
+        return;
+    }
+
+    xSemaphoreTake(sample_mutex, portMAX_DELAY);
+    dropped = pending_ts_correction_ms;
+    pending_ts_correction_ms = 0;
+    xSemaphoreGive(sample_mutex);
+
+    if (dropped != 0)
+    {
+        ESP_LOGW(TAG, "Dropping a %lld ms timestamp correction: its rows rotated away", dropped);
+    }
+}
+
+/**
+ * @brief Note where this session's rows start, for the correction above
+ *
+ * Call with db_mutex held, right after the database is opened - at boot, after
+ * a rotation, and after a remount. Everything already in the file belongs to an
+ * earlier session and is off limits to a clock correction.
+ */
+static void obd_logger_mark_session_start(void)
+{
+    sqlite3_stmt *stmt = NULL;
+
+    session_first_rowid = 1;
+
+    if (db_file == NULL)
+    {
+        return;
+    }
+
+    if (sqlite3_prepare_v2(db_file, "SELECT IFNULL(MAX(rowid), 0) FROM param_data;",
+                           -1, &stmt, NULL) == SQLITE_OK)
+    {
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+        {
+            session_first_rowid = sqlite3_column_int64(stmt, 0) + 1;
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    ESP_LOGI(TAG, "Clock corrections limited to param_data rowid >= %lld", session_first_rowid);
 }
 
 /**
@@ -490,6 +562,14 @@ static void obd_logger_db_event_handler(obd_db_event_t event, void* event_data)
                         // file holds param_data rows whose param_id resolves to
                         // nothing - and at a fast sample rate rotation happens often.
                         obd_logger_repopulate_params();
+
+                        // New file: this session's rows start over here, and
+                        // a correction still queued belonged to the file we
+                        // just rotated away from - the rows it was meant for
+                        // are unreachable and the new file's are already on the
+                        // corrected epoch, so it must be dropped, not applied.
+                        obd_logger_mark_session_start();
+                        obd_logger_discard_ts_correction();
                     }
                     
                     // If we took the mutex during rotation start, release it now
@@ -585,6 +665,7 @@ void obd_logger_unlock_open(void) {
         
         // Open the database
         obd_logger_db_open(db_path, &db_file);
+        obd_logger_mark_session_start();
     } else {
         ESP_LOGE(TAG, "Failed to get current database path");
     }
@@ -1021,7 +1102,11 @@ static esp_err_t init_db_tables(void)
         
         // Increase cache size to reduce disk I/O
         obd_logger_db_exec(db_file, "PRAGMA cache_size = 20000;");
-        
+
+        // The file may already hold rows from an earlier boot (the DB manager
+        // reuses the one db_index.json points at), so record where ours start.
+        obd_logger_mark_session_start();
+
         ESP_LOGI(TAG, "Database tables initialized");
         xSemaphoreGive(db_mutex);
     }

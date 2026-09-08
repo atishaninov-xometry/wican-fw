@@ -140,9 +140,17 @@ clock once the station link came up. A plausible-range check alone doesn't catch
 (2033 is inside any sane window). Fixed by anchoring the wall clock against a
 monotonic timer; a jump larger than a couple of seconds against elapsed monotonic time
 is treated as a clock correction, and the same delta is applied to both the buffered
-samples in RAM and the rows already written to the currently-open file. Rows in an
-already-rotated file keep their original (wrong) epoch - the correction lands well
-before the first rotation in practice. The filename itself still comes from whatever
+samples in RAM and the rows already written to the currently-open file - but only to
+the rows *this session* wrote (`WHERE rowid >= session_first_rowid`, recorded whenever
+the DB is opened: boot, rotation, remount). That bound matters because the DB manager
+reuses whatever file `db_index.json` points at rather than starting a fresh one per
+boot, so at a 128MB rotation limit the open file can already hold weeks of correctly
+stamped rows from earlier sessions; an unbounded `UPDATE param_data SET timestamp =
+timestamp + delta` would shift all of them (and rewrite ~5M rows while holding the DB
+mutex). A correction still queued when a rotation happens is dropped rather than
+applied - its rows are unreachable in the closed file, and the new file's rows are
+already on the corrected epoch. Rows in an already-rotated file keep their original
+(wrong) epoch. The filename itself still comes from whatever
 the clock said at creation time, so a file written across such a boot can still be
 named wrongly even though its rows end up correct.
 
@@ -153,7 +161,9 @@ named wrongly even though its rows end up correct.
   checkpoint/unmount, hence the safe-eject/sleep-flush/auto-remount handling.
 - Param IDs are per-file (each rotated `.db` recreates `param_info`) - map through
   each file's own `param_info` when merging across files. `db_index.json` is the file
-  manifest.
+  manifest, and also names the `current_db` that the next boot **reopens and appends
+  to** - a `.db` is not one session, and at 128MB/file it can hold many drives, so its
+  filename's timestamp is only the moment the file was created.
 - Extract a log cleanly: engine-off (auto-flush) or safe-eject (solid green LED)
   before downloading, else a live download of the active `.db` can be 0 bytes or
   missing WAL rows.

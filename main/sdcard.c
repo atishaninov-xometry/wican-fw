@@ -14,6 +14,10 @@
 #include "dev_status.h"
 #include "filesystem.h"
 #include "restart_tracker.h"
+#include "obd_logger.h"
+#include "led.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define OTA_BUFFER_SIZE 4096  
 
@@ -312,7 +316,8 @@ esp_err_t sd_card_deinit(void)
     }
     #endif
     s_card_mounted = false;
-    
+    dev_status_clear_bits(DEV_SDCARD_MOUNTED_BIT);
+
     ESP_LOGI(TAG, "SD card unmounted successfully");
     return ESP_OK;
 }
@@ -457,4 +462,59 @@ esp_err_t sdcard_test_rw(void)
     
     ESP_LOGI(TAG, "SD card read/write test passed");
     return ESP_OK;
+}
+
+esp_err_t sdcard_safe_eject(void)
+{
+    if (!s_card_mounted)
+    {
+        ESP_LOGI(TAG, "SD card already unmounted");
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "Preparing SD card for ejection...");
+    led_set_level(255, 255, 0);            /* yellow = working (blue is idle, green is "safe to eject") */
+
+    if (obd_logger_is_initialized())
+    {
+        obd_logger_disable();              /* stop the logger writing */
+        vTaskDelay(pdMS_TO_TICKS(300));    /* let any in-flight write finish */
+        obd_logger_lock_close();           /* checkpoint WAL + sqlite3_close -> flush to .db, hold lock */
+    }
+
+    esp_err_t ret = sd_card_deinit();      /* unmount FATFS -> flush cache */
+    if (ret == ESP_OK)
+    {
+        ESP_LOGW(TAG, "SD safely unmounted - OK to remove the card.");
+        led_set_level(0, 255, 0);          /* solid green = safe to eject */
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Unmount failed: %s", esp_err_to_name(ret));
+        led_set_level(255, 0, 0);          /* red = error */
+    }
+    return ret;
+}
+
+esp_err_t sdcard_manual_remount(void)
+{
+    led_set_level(255, 255, 0);            /* yellow = working */
+    esp_err_t ret = sd_card_init();
+    if (ret == ESP_OK)
+    {
+        ESP_LOGW(TAG, "SD card remounted, resuming logger...");
+        if (obd_logger_is_initialized())
+        {
+            obd_logger_unlock_open();      /* reopen the DB at the current path, release the lock held since eject */
+            obd_logger_enable();
+        }
+        led_set_level(135, 206, 235);      /* blue = idle/resumed */
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Remount attempt failed - card not present/readable yet.");
+        led_set_level(255, 0, 0);
+    }
+    return ret;
 }

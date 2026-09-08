@@ -99,6 +99,27 @@ esp_err_t sdcard_test_rw(void);
  */
 esp_err_t sdcard_perform_ota_update(const char* firmware_path);
 
+/**
+ * @brief Safely eject the SD card: stop the logger, checkpoint + close its DB
+ * (holding the lock), and unmount FATFS. Safe to call whether or not the
+ * logger is initialized, and a no-op if the card is already unmounted.
+ * Shared by the physical long-press button and the web UI's eject button.
+ *
+ * @return ESP_OK if the card ends up unmounted (including "already was"),
+ *         an error code if the unmount itself failed.
+ */
+esp_err_t sdcard_safe_eject(void);
+
+/**
+ * @brief Remount the SD card and, if it was initialized, reopen the logger's
+ * DB and resume logging. Shared by the card-detect auto-remount, the
+ * physical button's manual-retry fallback, and the web UI.
+ *
+ * @return ESP_OK on success, an error code if the card still isn't
+ *         present/readable.
+ */
+esp_err_t sdcard_manual_remount(void);
+
 #ifdef __cplusplus
 }
 #endif

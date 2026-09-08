@@ -573,6 +573,112 @@ void safe_mode_check(void)
 	}
 }
 
+#if HARDWARE_VER == WICAN_PRO
+/* Runtime "safe eject" for the SD card: hold the button ~3s while running to
+ * flush/close the SQLite log DB and unmount FATFS (logger runs
+ * synchronous=OFF, so nothing is durable until checkpoint/unmount). The web
+ * UI's eject/remount buttons call the same sdcard_safe_eject()/
+ * sdcard_manual_remount() directly, so this task watches actual mount state
+ * (sdcard_is_mounted()) rather than its own button-press history -- either
+ * trigger arms the same auto-remount watch below.
+ *
+ * Whenever the card is unmounted, this task watches SDCARD_DETECT_PIN for a
+ * removal followed by a re-insertion and remounts + resumes logging
+ * automatically with no user action. "Removal" is defined relative to the
+ * pin level observed at the moment eject was noticed (when the card is known
+ * to still be seated), so this works regardless of the detect switch's
+ * actual polarity. Holding the button while unmounted forces an immediate
+ * remount attempt as a manual fallback, independent of the detect pin.
+ *
+ * Boot-time button functions (safe mode / SD-OTA) are checked before this
+ * task starts, so they're unaffected. */
+static void sdcard_eject_button_task(void *arg)
+{
+    const int HOLD_MS = 3000;
+    const int POLL_MS = 50;
+    const int DEBOUNCE_MS = 300;
+    bool was_mounted = sdcard_is_mounted();
+    bool watching = !was_mounted;
+    bool removal_seen = false;
+    int present_level = gpio_get_level(SDCARD_DETECT_PIN);  /* level seen with the card known seated */
+    int stable_level = present_level;
+    int stable_ms = 0;
+
+    for (;;)
+    {
+        bool mounted_now = sdcard_is_mounted();
+        if (mounted_now && !was_mounted)
+        {
+            watching = false;                      /* just remounted (any trigger) */
+        }
+        else if (!mounted_now && was_mounted)
+        {
+            watching = true;                       /* just ejected (any trigger): arm the watch */
+            removal_seen = false;
+            present_level = gpio_get_level(SDCARD_DETECT_PIN);
+            stable_level = present_level;
+            stable_ms = 0;
+        }
+        was_mounted = mounted_now;
+
+        if (gpio_get_level(BUTTON_GPIO_NUM) == 0)   /* active-low (pull-up) */
+        {
+            int held = 0;
+            while (gpio_get_level(BUTTON_GPIO_NUM) == 0 && held < HOLD_MS)
+            {
+                vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+                held += POLL_MS;
+            }
+            if (held >= HOLD_MS)
+            {
+                if (mounted_now)
+                {
+                    ESP_LOGW("SDEJECT", "Button held: ejecting SD card...");
+                    sdcard_safe_eject();
+                }
+                else
+                {
+                    ESP_LOGW("SDEJECT", "Button held: retrying SD card mount...");
+                    sdcard_manual_remount();
+                }
+                /* wait for release so we don't retrigger */
+                while (gpio_get_level(BUTTON_GPIO_NUM) == 0)
+                    vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+            }
+        }
+        else if (watching)
+        {
+            int level = gpio_get_level(SDCARD_DETECT_PIN);
+            if (level == stable_level)
+            {
+                stable_ms += POLL_MS;
+            }
+            else
+            {
+                stable_level = level;
+                stable_ms = 0;
+            }
+
+            if (stable_ms >= DEBOUNCE_MS)
+            {
+                if (!removal_seen && stable_level != present_level)
+                {
+                    ESP_LOGI("SDEJECT", "SD card removal detected.");
+                    removal_seen = true;
+                }
+                else if (removal_seen && stable_level == present_level)
+                {
+                    ESP_LOGI("SDEJECT", "SD card re-insertion detected, remounting...");
+                    sdcard_manual_remount();
+                    removal_seen = false;  /* wait for a fresh remove/insert cycle either way */
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+    }
+}
+#endif
+
 void app_main(void)
 {
 	// Pin the process timezone to UTC before anything touches the clock (RTC,
@@ -1179,6 +1285,9 @@ void app_main(void)
     gpio_set_level(PWR_LED_GPIO_NUM, 1);
 	#elif HARDWARE_VER == WICAN_PRO
 	led_set_level(0,0,200);
+
+	// watch the button for a runtime "safe eject" of the SD card
+	xTaskCreate(sdcard_eject_button_task, "sd_eject", 8192, NULL, 3, NULL);
 
 	if(gpio_get_level(USB_ID_PIN) == 0)
 	{

@@ -87,6 +87,7 @@
 #include "obd_logger_iface.h"
 #include "https_client_mgr.h"
 #include "sdcard.h"
+#include "obd_logger_db_manager.h"
 #include "obd2_standard_pids.h"
 #include "wifi_mgr.h"
 #include "dev_status.h"
@@ -1328,6 +1329,38 @@ static esp_err_t system_reboot_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t sdcard_eject_handler(httpd_req_t *req)
+{
+    if (sdcard_safe_eject() == ESP_OK)
+    {
+        httpd_resp_send(req, "SD card safely unmounted - OK to remove.", HTTPD_RESP_USE_STRLEN);
+    }
+    else
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to eject SD card");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t sdcard_rollover_handler(httpd_req_t *req)
+{
+    if (!sdcard_is_mounted())
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SD card is not mounted");
+        return ESP_OK;
+    }
+
+    if (obd_db_manager_force_rotation() == ESP_OK)
+    {
+        httpd_resp_send(req, "Rolled over to a new log file.", HTTPD_RESP_USE_STRLEN);
+    }
+    else
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to rotate log file");
+    }
+    return ESP_OK;
+}
+
 static esp_err_t system_commands_handler(httpd_req_t *req)
 {
     char *buf = NULL;
@@ -2424,6 +2457,18 @@ static const httpd_uri_t system_reboot = {
     .method    = HTTP_POST,
     .handler   = system_reboot_handler,
     .user_ctx  = NULL    // Pass server data as context
+};
+static const httpd_uri_t sdcard_eject_uri = {
+    .uri       = "/sdcard_eject",
+    .method    = HTTP_POST,
+    .handler   = sdcard_eject_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t sdcard_rollover_uri = {
+    .uri       = "/sdcard_rollover",
+    .method    = HTTP_POST,
+    .handler   = sdcard_rollover_handler,
+    .user_ctx  = NULL
 };
 static const httpd_uri_t store_auto_data_uri = {
     .uri       = "/store_auto_data",
@@ -3530,6 +3575,8 @@ static void register_server_uris(void)
 	httpd_register_uri_handler(server, &destinations_stats_uri);
 	httpd_register_uri_handler(server, &store_car_data_uri);
 	httpd_register_uri_handler(server, &system_commands);
+	httpd_register_uri_handler(server, &sdcard_eject_uri);
+	httpd_register_uri_handler(server, &sdcard_rollover_uri);
 	httpd_register_uri_handler(server, &scan_available_pids_uri);
 	httpd_register_uri_handler(server, &std_pid_info);
 	

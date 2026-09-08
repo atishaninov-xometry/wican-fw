@@ -332,17 +332,36 @@ static esp_err_t build_basic_auth_value(const char *user, const char *pass,
     heap_caps_check_integrity_all(true);
 #endif
      
-     // Perform request
-     esp_err_t err = esp_http_client_perform(client);
+     // Open the connection and send the request ourselves (rather than
+     // esp_http_client_perform(), which reads -- and discards, since no
+     // HTTP_EVENT_ON_DATA handler is registered here -- the whole response
+     // body internally). set_post_field() above already staged the body for
+     // POST/PUT, so open() with its length writes it automatically; then
+     // fetch_headers() gets us to the point read_http_response() expects.
+     int write_len = 0;
+     if ((method == HTTPS_METHOD_POST || method == HTTPS_METHOD_PUT) && data) {
+         write_len = (int)data_len;
+     }
+     esp_err_t err = esp_http_client_open(client, write_len);
      if (err != ESP_OK) {
-         ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
+         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
          esp_http_client_cleanup(client);
 #if defined(CONFIG_HEAP_POISONING_LIGHT) || defined(CONFIG_HEAP_POISONING_COMPREHENSIVE)
           heap_caps_check_integrity_all(true);
 #endif
          return err;
      }
-     
+
+     if (esp_http_client_fetch_headers(client) < 0) {
+         ESP_LOGE(TAG, "Failed to fetch HTTP response headers");
+         esp_http_client_close(client);
+         esp_http_client_cleanup(client);
+#if defined(CONFIG_HEAP_POISONING_LIGHT) || defined(CONFIG_HEAP_POISONING_COMPREHENSIVE)
+          heap_caps_check_integrity_all(true);
+#endif
+         return ESP_FAIL;
+     }
+
      // Read response
      err = read_http_response(client, response);
      if (err != ESP_OK) {

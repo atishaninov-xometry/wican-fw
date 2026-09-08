@@ -382,8 +382,11 @@ async function updateChart() {
                             const row = stmt.get();
                             const [timestamp, value] = row;
                             
-                            // Convert timestamp (seconds) to milliseconds
-                            const time = timestamp * 1000;
+                            // param_data.timestamp is epoch MILLISECONDS. Logs written
+                            // before the ms migration stored seconds, so accept both:
+                            // 1e11 ms is 1973 and 1e11 s is year 5138, so the magnitude
+                            // tells them apart unambiguously.
+                            const time = timestamp > 1e11 ? timestamp : timestamp * 1000;
                             
                             data.push({
                                 x: moment(time).toDate(),
@@ -419,7 +422,10 @@ async function updateChart() {
                         x: {
                             type: 'time',
                             time: {
-                                unit: 'minute',
+                                // No fixed unit: Chart.js picks one from the span. Pinning
+                                // it to 'minute' throws "too far apart with stepSize of 1
+                                // minute" whenever a log covers more than a few days, and
+                                // it also hid the millisecond detail now being recorded.
                                 displayFormats: {
                                     millisecond: 'HH:mm:ss.SSS',
                                     second: 'HH:mm:ss',
@@ -530,31 +536,60 @@ async function updateChart() {
         const dateRangePicker = $('#dateRange').data('daterangepicker');
         if (!dateRangePicker) return;
         
-        const startDate = dateRangePicker.startDate.toISOString();
-        const endDate = dateRangePicker.endDate.toISOString();
-        
-        const relevantDbs = dbIndex.databases.filter(db => {
+        const startDate = toBackendUtcString(dateRangePicker.startDate);
+        const endDate = toBackendUtcString(dateRangePicker.endDate);
+
+        let relevantDbs = dbIndex.databases.filter(db => {
             return db.created <= endDate && (db.ended >= startDate || !db.ended);
         });
-        
+
+        // created/ended come from the filename's date, so a file written while the
+        // RTC was wrong (e.g. obd_log_20321500_005435) filters itself out and the
+        // range match silently finds nothing. Fall back to offering everything
+        // rather than producing an empty archive.
+        if (relevantDbs.length === 0 && dbIndex.databases.length > 0) {
+            console.warn('No database matched the selected range; falling back to all files');
+            relevantDbs = dbIndex.databases;
+        }
+
         if (relevantDbs.length === 0) {
-            alert('No databases found for the selected date range');
+            alert('No databases found on the card');
             return;
         }
-        
+
         // Create a zip file with all relevant databases
         const zip = new JSZip();
-        
+        const failed = [];
+        let added = 0;
+
         for (const db of relevantDbs) {
             try {
                 const response = await fetch(`/obd_logs/${db.filename}`);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
                 const blob = await response.blob();
+                if (blob.size === 0) {
+                    throw new Error('empty response');
+                }
                 zip.file(db.filename, blob);
+                added++;
             } catch (error) {
                 console.error(`Error downloading ${db.filename}:`, error);
+                failed.push(`${db.filename} (${error.message})`);
             }
         }
-        
+
+        // A zip with no entries is the failure that looks like success - say so
+        // instead of handing over a 22-byte archive.
+        if (added === 0) {
+            alert(`Could not download any database file.\n\n${failed.join('\n')}`);
+            return;
+        }
+        if (failed.length > 0) {
+            alert(`${added} file(s) downloaded, ${failed.length} failed:\n\n${failed.join('\n')}`);
+        }
+
         // Generate and download the zip file
         const content = await zip.generateAsync({type: 'blob'});
         const link = document.createElement('a');

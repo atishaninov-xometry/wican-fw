@@ -33,7 +33,7 @@
             "pid_init": "ATSH7DF;",
             "parameters": [
                 {
-                    "name": "ThrottlePos",
+                    "name": "ThrottlePlatePosition",
                     "expression": "B3*100/255",
                     "unit": "%",
                     "class": "none",
@@ -46,7 +46,7 @@
             "pid_init": "ATSH7DF;",
             "parameters": [
                 {
-                    "name": "ThrottleCmd",
+                    "name": "AcceleratorPedalPosition",
                     "expression": "B3*100/255",
                     "unit": "%",
                     "class": "none",
@@ -85,7 +85,7 @@
             "pid_init": "ATSH7DF;",
             "parameters": [
                 {
-                    "name": "Gear",
+                    "name": "CurrentGear",
                     "expression": "B4/16",
                     "unit": "none",
                     "class": "none",
@@ -119,7 +119,7 @@
             "pid_init": "ATSH7DF;",
             "parameters": [
                 {
-                    "name": "CoolantTemp",
+                    "name": "CoolantTemperature",
                     "expression": "B3-40",
                     "unit": "degC",
                     "class": "temperature",
@@ -132,7 +132,7 @@
             "pid_init": "ATSH7DF;",
             "parameters": [
                 {
-                    "name": "IntakeAirTemp",
+                    "name": "IntakeAirTemperature",
                     "expression": "B3-40",
                     "unit": "degC",
                     "class": "temperature",
@@ -145,7 +145,7 @@
             "pid_init": "ATSH7DF;",
             "parameters": [
                 {
-                    "name": "Battery",
+                    "name": "BatteryVoltage",
                     "expression": "[B3:B4]/1000",
                     "unit": "V",
                     "class": "voltage",
@@ -158,14 +158,14 @@
             "pid_init": "ATSH7DF;",
             "parameters": [
                 {
-                    "name": "FuelPct",
+                    "name": "FuelLevelPct",
                     "expression": "B3*100/255",
                     "unit": "%",
                     "class": "none",
                     "period": 10000
                 },
                 {
-                    "name": "FuelLevel_L",
+                    "name": "FuelLevelLiters",
                     "expression": "B3*49/255",
                     "unit": "L",
                     "class": "none",
@@ -173,7 +173,7 @@
                     "period": 10000
                 },
                 {
-                    "name": "FuelEmpty_L",
+                    "name": "FuelToEmptyLiters",
                     "expression": "(255-B3)*49/255",
                     "unit": "L",
                     "class": "none",
@@ -200,7 +200,7 @@
             "pid_init": "ATSH7E0;",
             "parameters": [
                 {
-                    "name": "BrakePressure",
+                    "name": "BrakeFluidPressure",
                     "expression": "[B4:B5]*100/128",
                     "unit": "kPa",
                     "class": "pressure",

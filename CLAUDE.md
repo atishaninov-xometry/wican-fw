@@ -39,7 +39,20 @@ same-day tags so it resets at midnight UTC instead of climbing forever like a ba
   firmware.
 - **Ambient temp (`01 46`)** returned NO DATA parked; untested with the engine
   running.
-- **Fuel calibration** (`FuelLevel_L = B3*49/255`, `FuelEmpty_L = (255-B3)*49/255`):
+- **Human-friendly parameter names** (renamed from the original abbreviated set):
+  `ThrottlePos` -> `ThrottlePlatePosition` (physical throttle-body sensor - on this
+  car it never reaches 100% even at full pedal, topping out at ~92%), `ThrottleCmd`
+  -> `AcceleratorPedalPosition` (PID `01 4C`, the ECU's *commanded* throttle - this
+  is the one that actually reads 100% at full pedal effort, confirmed from a log
+  where the pedal was held at max with the engine off/ignition on), `Gear` ->
+  `CurrentGear`, `CoolantTemp` -> `CoolantTemperature`, `IntakeAirTemp` ->
+  `IntakeAirTemperature`, `Battery` -> `BatteryVoltage`, `FuelPct` ->
+  `FuelLevelPct`, `BrakePressure` -> `BrakeFluidPressure`. Names are used as MQTT
+  JSON keys and as the logger's lookup key (`obd_logger_record_sample`), both plain
+  string matches with no schema, so this is a profile-only rename with no firmware
+  change - just re-import the JSON.
+- **Fuel calibration** (`FuelLevelLiters = B3*49/255`, `FuelToEmptyLiters = (255-B3)*49/255`,
+  renamed from `FuelLevel_L`/`FuelEmpty_L`):
   measured 2026-09-06 from a 10.0 L fill, bracketed by a clean 2m10s data gap
   (key-off-to-refuel) in `obd_log_20260906_131801_000.db`. B3 sat at a settled 176 for
   ~19s before the fill and 228 recurs as the post-fill ceiling (dips below are slosh);

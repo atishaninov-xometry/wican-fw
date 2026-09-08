@@ -1,4 +1,6 @@
 build/
+build_out/
+flash.ps1
 esp_idf_components/
 # Prerequisites
 *.d
@@ -63,6 +65,7 @@ docs/node_modules
 #managed components
 managed_components/
 .vscode/
+.claude/settings.local.json
 
 # Clangd Cache
 .cache/

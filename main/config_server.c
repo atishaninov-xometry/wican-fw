@@ -166,6 +166,8 @@ extern const unsigned char ws_client_js_start[] asm("_binary_ws_client_js_start"
 extern const unsigned char ws_client_js_end[] asm("_binary_ws_client_js_end");
 extern const unsigned char terminal_js_start[] asm("_binary_terminal_js_start");
 extern const unsigned char terminal_js_end[] asm("_binary_terminal_js_end");
+extern const unsigned char duration_parser_js_start[] asm("_binary_duration_parser_js_start");
+extern const unsigned char duration_parser_js_end[] asm("_binary_duration_parser_js_end");
 
 typedef struct {
     const char *uri;
@@ -185,6 +187,7 @@ static const file_lookup_t file_lookup[] = {
 	{"/main.js", "application/javascript", main_js_start, main_js_end, false, NULL, NULL},
 	{"/ws_client.js", "application/javascript", ws_client_js_start, ws_client_js_end, false, NULL, NULL},
 	{"/terminal.js", "application/javascript", terminal_js_start, terminal_js_end, false, NULL, NULL},
+	{"/duration_parser.js", "application/javascript", duration_parser_js_start, duration_parser_js_end, false, NULL, NULL},
 	{"/chartjs-adapter-moment.min.js", "application/javascript", NULL, NULL, true, SD_CARD_MOUNT_POINT"/wican_data/web/chartjs-adapter-moment.min.js", "https://cdn.jsdelivr.net/npm/chartjs-adapter-moment@1.0.0/dist/chartjs-adapter-moment.min.js"},
 	{"/jquery-3.6.0.min.js", "application/javascript", NULL, NULL, true, SD_CARD_MOUNT_POINT"/wican_data/web/jquery-3.6.0.min.js", "https://code.jquery.com/jquery-3.6.0.min.js"},
 	{"/bootstrap.bundle.min.js", "application/javascript", NULL, NULL, true, SD_CARD_MOUNT_POINT"/wican_data/web/bootstrap.bundle.min.js", "https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"},
@@ -3935,12 +3938,12 @@ int8_t config_server_get_wakeup_interval(uint32_t *wakeup_interval)
         return -1;
     }
     
-    // Validate range
-    if (wk_int < 5 || wk_int > 240)
+    // Validate range (5 min .. 1440 min = 24 h)
+    if (wk_int < 5 || wk_int > 1440)
 	{
         return -1;
     }
-    
+
     *wakeup_interval = (uint32_t)wk_int;
     return 1;
 }

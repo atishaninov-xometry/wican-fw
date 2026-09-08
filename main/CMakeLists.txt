@@ -107,6 +107,7 @@ idf_component_register(
         "web/src/main.js"
 		"web/src/ws_client.js"
 		"web/src/terminal.js"
+		"web/src/duration_parser.js"
         "web/src/dashboard_live.js"
         "web/safemode.html"
         # "obd_fw/V2.3.18.txt"

@@ -33,6 +33,7 @@
 #include "cJSON.h"
 #include "esp_littlefs.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "obd_logger_db_manager.h"
 #include "rtcm.h"
 
@@ -416,7 +417,11 @@ esp_err_t obd_db_manager_cleanup_old_files(void)
     }
     
     // Get a list of all database files
-    obd_db_file_info_t *db_files = malloc(sizeof(obd_db_file_info_t) * db_manager.config.max_db_files * 2);
+    // PSRAM-preferred: this scales with max_db_files, so keep it off internal
+    // SRAM regardless of how many files the card ends up holding.
+    obd_db_file_info_t *db_files = heap_caps_malloc(
+        sizeof(obd_db_file_info_t) * db_manager.config.max_db_files * 2,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (db_files == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for file list");
         return ESP_ERR_NO_MEM;

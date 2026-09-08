@@ -141,11 +141,12 @@
         if (cmd.length === 0) return;
 
         if (activeTermType === 'elm327') {
-            // Send raw, CR-terminated ELM commands so firmware can treat it like the TCP port.
+            // Must use the same {cmd:...} envelope as the console terminal -
+            // ws_router_handle_frame only dispatches frames starting with '{'.
 			// Also print a PuTTY-like transcript line even if ELM echo is off (ATE0).
 			ensureElmPrompt();
 			appendOut(cmd + '\n');
-            window.wicanWs.sendText(cmd + '\r');
+            window.wicanWs.sendJson({ cmd: cmd });
         } else {
 			appendOut(cmd + '\n');
             window.wicanWs.sendJson({ cmd: cmd });

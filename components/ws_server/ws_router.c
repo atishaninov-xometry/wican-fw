@@ -241,7 +241,8 @@ static esp_err_t ws_router_handle_terminal_cmd(httpd_req_t *req, const char *cmd
 			tmp[n++] = '\r';
 		}
 		tmp[n] = '\0';
-		elm327_run_command(tmp, (uint32_t)n, 2000, NULL, ws_elm327_output_cb, false, 0);
+		// 4s: ATZ and a cold first PID read can run longer than a typical 2s reply.
+		elm327_run_command(tmp, (uint32_t)n, 4000, NULL, ws_elm327_output_cb, false, 0);
 	}
 	else
 	{

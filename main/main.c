@@ -42,6 +42,8 @@
 #include "nvs_flash.h"
 #include <inttypes.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 #include "types.h"
 #include "ver.h"
 #include "hw_config.h"
@@ -573,6 +575,12 @@ void safe_mode_check(void)
 
 void app_main(void)
 {
+	// Pin the process timezone to UTC before anything touches the clock (RTC,
+	// FATFS/SD timestamps, log rows all assume this). Nothing else on this
+	// firmware is allowed to call setenv("TZ", ...) with a non-UTC value.
+	setenv("TZ", "UTC0", 1);
+	tzset();
+
 	void* internal_buf = NULL;
 	// internal_buf = heap_caps_malloc(75 * 1024, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	dev_status_init();

@@ -127,7 +127,7 @@ static void sync_sys_time(void *pvParameters)
             if (now >= MIN_VALID_TIME)
             {
                 struct tm timeinfo;
-                localtime_r(&now, &timeinfo);
+                gmtime_r(&now, &timeinfo);
                 ESP_LOGI(TAG, "Time sync successful: %04d-%02d-%02d %02d:%02d:%02d UTC",
                          timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);

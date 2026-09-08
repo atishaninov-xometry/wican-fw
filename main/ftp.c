@@ -270,7 +270,7 @@ static int ftp_get_eplf_item (char *dest, uint32_t destsize, struct dirent *de) 
 	struct tm *tm_info;
 	time_t now;
 	if (time(&now) < 0) now = 946684800;	// get the current time from the RTC
-	tm_info = localtime(&buf.st_mtime);		// get broken-down file time
+	tm_info = gmtime(&buf.st_mtime);		// get broken-down file time (UTC)
 
 	// if file is older than 180 days show dat,month,year else show month, day and time
 	if ((buf.st_mtime + FTP_UNIX_SECONDS_180_DAYS) < now) strftime(str_time, 127, "%b %d %Y", tm_info);
@@ -885,7 +885,7 @@ static void ftp_process_cmd (void) {
 				//snprintf((char *)ftp_data.dBuffer, ftp_buff_size, "20210212010203");
 				//time_t time = buf.st_mtime + (CONFIG_LOCAL_TIMEZONE*60*60);
 				time_t time = buf.st_mtime;
-				struct tm *ptm = localtime(&time);
+				struct tm *ptm = gmtime(&time); // MDTM reply must be UTC per RFC 3659
 				//char buf[128];
 				//strftime(buf, sizeof(buf), "%Y%m%d%H%M%S", ptm);
 				strftime((char *)ftp_data.dBuffer, ftp_buff_size, "%Y%m%d%H%M%S", ptm);

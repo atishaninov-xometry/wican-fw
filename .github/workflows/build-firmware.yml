@@ -1,0 +1,86 @@
+name: Build firmware (WiCAN Pro, IDF 6)
+
+on:
+  push:
+    branches:
+      - 'sd-logging-patches-**'
+      - 'custom-fork**'
+    paths-ignore:
+      - '**.md'
+      - 'imports/**'
+      - '.github/workflows/deploy-docs.yml'
+  workflow_dispatch:
+    inputs:
+      idf_version:
+        description: 'ESP-IDF version (docker image tag, e.g. v6.0.2 or v5.3.3)'
+        required: false
+        default: 'v6.0.2'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: ver
+        # github.run_number never resets, so a bare "$date-$run_number" scheme
+        # just keeps climbing across days instead of restarting at 1 (e.g.
+        # 2026.09.01-10..15 then straight to 2026.09.02-16). Instead, count
+        # existing "vYYYY.MM.DD_*" tags for today and take the next one, so
+        # the per-day sequence actually resets at midnight UTC.
+        run: |
+          set -eu
+          today="$(date -u +%Y.%m.%d)"
+          git fetch --tags --quiet
+          count=$(git tag -l "v${today}_*" | wc -l)
+          seq=$((count + 1))
+          echo "calver=${today}_${seq}" >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate dependency lock for this IDF
+        # committed lock has hashes from an older component manager; IDF 6 rejects them
+        run: rm -f dependencies.lock
+
+      - name: ESP-IDF build (target esp32s3)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ github.event.inputs.idf_version || 'v6.0.2' }}
+          target: esp32s3
+          command: idf.py build
+
+      - name: Stage flashable artifacts
+        run: |
+          set -eu
+          mkdir -p artifacts
+          cp build/*.bin artifacts/ 2>/dev/null || true
+          cp build/bootloader/bootloader.bin artifacts/
+          cp build/partition_table/partition-table.bin artifacts/
+          cp build/flasher_args.json artifacts/
+          echo "${{ steps.ver.outputs.calver }} (${{ github.sha }})" > artifacts/BUILD_INFO.txt
+          ls -la artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: wican-fw-obd-pro-${{ steps.ver.outputs.calver }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.ver.outputs.calver }}
+          target_commitish: ${{ github.sha }}
+          name: "WiCAN Pro firmware v${{ steps.ver.outputs.calver }}"
+          body_path: artifacts/BUILD_INFO.txt
+          files: artifacts/*
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true

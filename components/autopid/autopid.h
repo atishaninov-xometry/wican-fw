@@ -129,6 +129,10 @@ typedef struct
     int64_t timer;
     float value;
     bool failed;
+    // For PID_STD only: the resolved std_parameter_t* from obd2_standard_pids.h,
+    // looked up once at config-parse time. Runtime decoding uses this instead of
+    // re-deriving it from name, so name is free to be a user-chosen label.
+    const void *std_param;
 }parameter_t;
 
 typedef struct 
@@ -212,7 +216,7 @@ typedef struct
 } autopid_data_t;
 
 void autopid_parser(char *str, uint32_t len, QueueHandle_t *q, char* cmd_str);
-void autopid_init(char* id, bool enable_logging, uint32_t logging_period);
+void autopid_init(char* id, bool enable_logging, uint32_t logging_period, uint32_t logging_poll_period);
 char *autopid_data_read(void);
 bool autopid_get_ecu_status(void);
 char* autopid_get_config(void);

@@ -62,6 +62,16 @@ same-day tags so it resets at midnight UTC instead of climbing forever like a ba
   assumed, not measured - a second fill from near-empty would confirm the low end.
   Don't use moving readings to sanity-check this: the same unchanged tank read
   anywhere from 138-194 raw while driving in the 70s before the stop (slosh).
+  **Confirmed by a second, larger fill** (2026-09-12, 27.06 L, "fullest I can get it on
+  flat surface"): bracketed by a clean 4m30s engine-off gap (`obd.db`,
+  14:44:24-14:48:54 UTC) that matches a GPS position hold exactly. Post-fill instant
+  reading was raw **228 again** - the identical ceiling from the first fill, on a
+  different amount, on a different day, which is what actually pins 228 as the
+  sender's physical top rather than a one-off. No clean settled *pre*-fill reading
+  was available this time (stop came right off the autobahn, so B3 was mid-slosh,
+  swinging 28-133 in the preceding minutes) - the median of the last engine-on segment
+  (14 samples, median raw 89.5) implies a full scale of ~49.8 L, within 1.5% of the
+  49.04 L above. Consistent, not independently precise enough to move the number.
 - **`TrueSpeed` (`= B3*1.018`, same `01 0D` PID/byte as `VehicleSpeed`, so no extra
   request)**: `VehicleSpeed` is the raw ECU wheel-speed PID, not the dash display, and
   it reads a couple percent *below* true ground speed on this car - the opposite
@@ -79,6 +89,26 @@ same-day tags so it resets at midnight UTC instead of climbing forever like a ba
   cross-correlating the two speed series) and the same sign/magnitude of difference,
   so this isn't a one-off fluke - but it's still a single car's single set of tires at
   one point in time, not a general OBD/GPS constant; re-derive if tires are replaced.
+  **Confirmed again 2026-09-12** on the return leg (Berlin-Leipzig, same day): the
+  dashcam clock had *also* drifted differently on this leg (-1.3s vs the outbound
+  leg's -11.9s, most likely a GPS time refix after the ~2.5h Berlin stop) - a single
+  whole-day lag search only gets r=0.989 and must not be used; aligning each leg to
+  its own best-fit lag recovers r=0.9998-0.99994 on both. With that fixed, two of the
+  driver's own cruise/limiter holds landed exactly where predicted before analysis -
+  the clearest confirmation this calibration has had:
+  - "123 km/h" stretch, ~17:13 local: cleanest plateau (23s, GPS sd 0.26) gives
+    GPS=119.47, OBD=117.47 (-1.67%); `OBD*1.018=119.58`, 0.09% from GPS.
+  - "83 km/h" stretch, ~17:35 local: GPS=79.77, OBD=78.52 (-1.57%); `OBD*1.018=79.94`,
+    0.21% from GPS.
+  - Whole-day re-run, 82 independent plateaus (both legs): -1.83%, 95% CI
+    [-1.89%,-1.78%] -> multiplier 1.019 - within noise of the 1.018 already in the
+    profile, so left as-is.
+  - Bonus, unasked-for but explains the original 3% guess: the dash/cruise **display**
+    for those same two stretches was 123 and 83 - i.e. the *dash* reads about +3%
+    high vs GPS (123/119.5, 83/80), the classic EU speedometer-tolerance direction.
+    OBD's -1.8% and the dash's +3% are two different, opposite biases on the same
+    wheel-speed signal - one upstream of the dash's legally-mandated padding, one
+    downstream of it.
 - Import format for AutoPID profiles must be the array/converted form
   (`parameters: [{name, expression, ...}]`), not the shorthand map form
   (`parameters: {Name: "expr"}`) - the web UI detects shorthand and does an untimed

@@ -51,27 +51,43 @@ same-day tags so it resets at midnight UTC instead of climbing forever like a ba
   JSON keys and as the logger's lookup key (`obd_logger_record_sample`), both plain
   string matches with no schema, so this is a profile-only rename with no firmware
   change - just re-import the JSON.
-- **Fuel calibration** (`FuelLevelLiters = B3*49/255`, `FuelToEmptyLiters = (255-B3)*49/255`,
-  renamed from `FuelLevel_L`/`FuelEmpty_L`):
-  measured 2026-09-06 from a 10.0 L fill, bracketed by a clean 2m10s data gap
-  (key-off-to-refuel) in `obd_log_20260906_131801_000.db`. B3 sat at a settled 176 for
-  ~19s before the fill and 228 recurs as the post-fill ceiling (dips below are slosh);
-  both anchors are good to about ±1 count. 52 counts = 10.0 L -> 0.1923 L/count -> byte
-  255 = 49.04 L (±2 counts -> 47.2-51.0 L). The prior `45/255` guess read the same fill
-  as 9.18 L, 8.2% low. Anchored over 33.85-43.85 L; linearity below half a tank is
-  assumed, not measured - a second fill from near-empty would confirm the low end.
-  Don't use moving readings to sanity-check this: the same unchanged tank read
-  anywhere from 138-194 raw while driving in the 70s before the stop (slosh).
-  **Confirmed by a second, larger fill** (2026-09-12, 27.06 L, "fullest I can get it on
-  flat surface"): bracketed by a clean 4m30s engine-off gap (`obd.db`,
-  14:44:24-14:48:54 UTC) that matches a GPS position hold exactly. Post-fill instant
-  reading was raw **228 again** - the identical ceiling from the first fill, on a
-  different amount, on a different day, which is what actually pins 228 as the
-  sender's physical top rather than a one-off. No clean settled *pre*-fill reading
-  was available this time (stop came right off the autobahn, so B3 was mid-slosh,
-  swinging 28-133 in the preceding minutes) - the median of the last engine-on segment
-  (14 samples, median raw 89.5) implies a full scale of ~49.8 L, within 1.5% of the
-  49.04 L above. Consistent, not independently precise enough to move the number.
+- **Fuel calibration** (`FuelLevelLiters = B3*50.5/255`, `FuelToEmptyLiters =
+  (255-B3)*50.5/255`, renamed from `FuelLevel_L`/`FuelEmpty_L`), from two fills:
+  - **2026-09-06, 10.0 L**: clean 2m10s key-off-to-refuel gap
+    (`obd_log_20260906_131801_000.db`). B3 settled at 176 for ~19s before the fill,
+    228 recurs as the post-fill ceiling. 52 counts = 10.0 L -> 0.1923 L/count -> byte
+    255 = 49.04 L +/-1.89 (+/-2-count anchors).
+  - **2026-09-12, 27.06 L, "fullest I can get it on flat surface", inside Berlin**:
+    a clean 4m30s engine-off gap (`obd.db`, 16:44:24-16:48:54 local) matching both a
+    GPS position hold and `BatteryVoltage` dropping to ~12.8V within seconds of the
+    RPM->0 transition (alternator off, battery on its own) - confirming the identified
+    stop is real and not a start-stop-system traffic-light blip (every other RPM=0 in
+    that Berlin drive was under 45s; several of *those* brief stops sag to a similar
+    ~12.7-12.9V too, since a lead-acid battery's post-charging voltage settles within
+    seconds, not minutes - so voltage confirms the alternator state, but it's the
+    stop's outlier *duration* that actually picks it out from city stop-start noise).
+    Post-fill instant reading was raw **228 again** - the same ceiling as the first
+    fill, on a different amount, on a different day, which is what actually pins 228
+    as the sender's physical top rather than a one-off.
+    First attempt at a pre-fill reading used the raw instantaneous samples right at
+    shutdown and wrongly blamed "highway slosh" (sd 19.3 raw counts) for not matching
+    the first fill's precision - wrong on two counts: this fill was city driving, not
+    autobahn, and the car had already been stationary a couple of minutes before
+    pumping started, so there should have been nothing left to slosh. The actual
+    problem was mixing in samples taken *while still moving* through Berlin traffic.
+    Filtering to only the samples where `VehicleSpeed==0` at that instant (32 of 111,
+    from the preceding ~30 min) cuts the spread to sd 7.8 and gives a stable **median
+    raw 92**, reproduced identically whether using all 32 stopped samples or just the
+    7 from the last 5 minutes before shutdown. 136 counts = 27.06 L -> 0.1990 L/count
+    -> byte 255 = 50.74 L +/-0.75.
+  - **Combined** (inverse-variance weighted): **0.1981 L/count, byte 255 = 50.5 L
+    +/-0.69** - a real upward revision from 49.04 L (+3.0%), not just confirmation;
+    the two measurements' uncertainty ranges overlap but the second fill's larger
+    delta (136 vs 52 counts) makes it meaningfully more precise. Anchored over
+    16.8-43.9 L combined; linearity below ~17 L is still assumed, not measured.
+  - Don't sanity-check a settled reading against samples taken while the car is
+    moving - swings of 100+ raw counts from slosh alone are normal even in slow
+    stop-start city traffic, not just highway driving.
 - **`TrueSpeed` (`= B3*1.018`, same `01 0D` PID/byte as `VehicleSpeed`, so no extra
   request)**: `VehicleSpeed` is the raw ECU wheel-speed PID, not the dash display, and
   it reads a couple percent *below* true ground speed on this car - the opposite

@@ -173,7 +173,7 @@
                 },
                 {
                     "name": "FuelLevelLiters",
-                    "expression": "B3*49/255",
+                    "expression": "B3*50.5/255",
                     "unit": "L",
                     "class": "none",
                     "min": 0,
@@ -181,7 +181,7 @@
                 },
                 {
                     "name": "FuelToEmptyLiters",
-                    "expression": "(255-B3)*49/255",
+                    "expression": "(255-B3)*50.5/255",
                     "unit": "L",
                     "class": "none",
                     "min": 0,

@@ -25,6 +25,13 @@
                     "unit": "km/h",
                     "class": "speed",
                     "period": 100
+                },
+                {
+                    "name": "TrueSpeed",
+                    "expression": "B3*1.018",
+                    "unit": "km/h",
+                    "class": "speed",
+                    "period": 100
                 }
             ]
         },

@@ -62,6 +62,23 @@ same-day tags so it resets at midnight UTC instead of climbing forever like a ba
   assumed, not measured - a second fill from near-empty would confirm the low end.
   Don't use moving readings to sanity-check this: the same unchanged tank read
   anywhere from 138-194 raw while driving in the 70s before the stop (slosh).
+- **`TrueSpeed` (`= B3*1.018`, same `01 0D` PID/byte as `VehicleSpeed`, so no extra
+  request)**: `VehicleSpeed` is the raw ECU wheel-speed PID, not the dash display, and
+  it reads a couple percent *below* true ground speed on this car - the opposite
+  direction from the dash (which is legally padded to never read low). Calibrated
+  against a dashcam GPS log (`gps-visualize` format: local-time CSV, speed in
+  **knots** - confirmed by regressing GPS-derived speed against the file's own speed
+  field until the unit conversion made the slope land at 1) over a 2.5h Leipzig-Berlin
+  drive including the car's ~200 km/h limiter plateaus. Best estimate from 38
+  independent steady-speed segments (cruise/limiter stretches >=15s, GPS held within
+  3 km/h): OBD reads **-1.77% vs GPS, 95% CI [-1.87%, -1.68%]** -> `1/0.9823 = 1.018`.
+  Four other methods (regression, through-origin ratio, distance integral, per-bin
+  ratio 5-210 km/h) agree within -1.5% to -2.2%, flat across the whole range with a
+  small trend (-1.5% under 100 km/h, -1.9% above). Two independent GPS logs (2026-09-10
+  and 2026-09-12) landed on the same dashcam-clock drift (~11-12s, corrected by
+  cross-correlating the two speed series) and the same sign/magnitude of difference,
+  so this isn't a one-off fluke - but it's still a single car's single set of tires at
+  one point in time, not a general OBD/GPS constant; re-derive if tires are replaced.
 - Import format for AutoPID profiles must be the array/converted form
   (`parameters: [{name, expression, ...}]`), not the shorthand map form
   (`parameters: {Name: "expr"}`) - the web UI detects shorthand and does an untimed

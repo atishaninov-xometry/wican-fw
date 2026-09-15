@@ -710,6 +710,23 @@
                             
                             <div class="section-card">
                                 <div class="section-header">
+                                    <i data-lucide="database" class="section-icon"></i>
+                                    <h3 class="section-title">Raw Database Files</h3>
+                                </div>
+                                <p class="text-muted" style="font-size: 0.875rem;">
+                                    Direct downloads, streamed from the card as-is - no parsing, so these
+                                    always work even while a large file is still loading below.
+                                </p>
+                                <div class="parameter-list" id="rawFileList">
+                                    <div class="loading-spinner" id="rawFileLoading">
+                                        <div class="spinner-border text-primary me-3" role="status"></div>
+                                        <span>Loading file list...</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="section-card">
+                                <div class="section-header">
                                     <i data-lucide="settings" class="section-icon"></i>
                                     <h3 class="section-title">Parameters</h3>
                                 </div>
@@ -717,9 +734,10 @@
                                     <input type="text" id="paramSearch" class="form-control" placeholder="Search parameters...">
                                 </div>
                                 <div class="parameter-list" id="parameterList">
-                                    <div class="loading-spinner" id="paramLoading">
-                                        <div class="spinner-border text-primary me-3" role="status"></div>
-                                        <span>Loading parameters...</span>
+                                    <div class="alert alert-info" id="paramLoading">
+                                        Select a date range above and click <strong>Apply</strong> to parse
+                                        and chart it. Nothing here is loaded automatically, so a huge file
+                                        can't block the raw downloads above.
                                     </div>
                                 </div>
                             </div>

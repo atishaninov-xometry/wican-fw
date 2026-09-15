@@ -273,3 +273,34 @@ named wrongly even though its rows end up correct.
 - Extract a log cleanly: engine-off (auto-flush) or safe-eject (solid green LED)
   before downloading, else a live download of the active `.db` can be 0 bytes or
   missing WAL rows.
+
+## Dashboard viewer: raw downloads must not depend on sql.js parsing
+
+At 128MB/file (see rotation above), the dashboard's chart viewer (`dashboard.js`)
+could hang the whole page and, with it, the download button: `DOMContentLoaded` used
+to `await initSqlJs(...)` and then immediately auto-parse every `.db` matching the
+default 7-day range through `new SQL.Database(arrayBuffer)`, which decodes the whole
+file into a WASM heap in one synchronous call with no yield point. On a big file that
+pegs the single JS main thread for a long time, and *everything* else on the page -
+including the "Download Selected Database Files" button, which only existed because
+of a `setTimeout(addDownloadButton, 1500)` racing that same parse - is stuck behind it
+until it finishes. A big file was therefore locking users out of the one thing that
+would have let them grab it and inspect it elsewhere.
+
+Fixed by making the chart path fully opt-in and independent of the download path:
+- `initSqlJs()` is now lazy (`ensureSqlJs()`, called only from
+  `loadAndStoreDatabaseFile()`) - nothing sql.js-related runs until the user actually
+  picks a range and hits Apply on the date picker. Page load no longer auto-calls
+  `fetchRelevantDatabases()` at all.
+- A new **Raw Database Files** panel lists every file from the `/obd_logs` index
+  (filename, size, an actual browser `<a href download>` per file) - built directly
+  from that small JSON, never sql.js, and rendered the moment the index arrives.
+  `/obd_logs/<filename>` was already served chunked from the card
+  (`obd_logger_db_file_handler`, `fread`/`httpd_resp_send_chunk` in a bounded loop,
+  not buffered whole into RAM) - the ESP32 side was never the bottleneck, only the
+  browser-side parse was.
+- The zip-multiple-files download button moved out of the `setTimeout` guess and into
+  `displayDatabaseInfo()`, called directly off the same index fetch - no more racing
+  a parse that might still be running.
+Net effect: opening the Logger Data tab does no parsing at all until asked, so a file
+too large (or malformed) for sql.js to handle can still always be downloaded plain.

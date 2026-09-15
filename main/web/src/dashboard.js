@@ -1,9 +1,17 @@
 document.addEventListener('DOMContentLoaded', async function() {
-    // Initialize SQLite
-    const SQL = await initSqlJs({
-        locateFile: file => `sql-wasm.wasm`
-    });
-    
+    // sql.js is only needed once the user actually asks to chart a range
+    // (fetchRelevantDatabases, triggered from the date picker's Apply). Loading
+    // it lazily on first use, rather than awaiting it here before anything else
+    // on the page can run, keeps the raw-file downloads below fully independent
+    // of it - they render from a plain JSON fetch and never need SQL at all.
+    let SQL = null;
+    async function ensureSqlJs() {
+        if (!SQL) {
+            SQL = await initSqlJs({ locateFile: file => `sql-wasm.wasm` });
+        }
+        return SQL;
+    }
+
     let dbIndex = null;
     let dbInstance = null;
     let currentDb = null;
@@ -49,16 +57,15 @@ document.addEventListener('DOMContentLoaded', async function() {
         });
     }
 
-    // Fetch database index first
+    // Fetch database index first. Deliberately NOT followed by an automatic
+    // fetchRelevantDatabases() call: that path pulls each matching .db through
+    // sql.js (new SQL.Database(arrayBuffer) parses the whole file synchronously,
+    // no yielding), and at the current rotation size that can peg the main
+    // thread for a long time. Raw downloads (below) are rendered from this
+    // index fetch alone and never touch sql.js, so they stay usable regardless -
+    // parsing for the chart is opt-in, triggered by picking a range and hitting
+    // Apply on the date picker.
     await fetchDatabaseIndex();
-    
-    // Fetch initial relevant databases based on default date range
-    const dateRangePicker = $('#dateRange').data('daterangepicker');
-    if (dateRangePicker) {
-        const startDate = toBackendUtcString(dateRangePicker.startDate);
-        const endDate = toBackendUtcString(dateRangePicker.endDate);
-        await fetchRelevantDatabases(startDate, endDate);
-    }
 
     /**
      * Fetch the database index from the server
@@ -85,25 +92,83 @@ document.addEventListener('DOMContentLoaded', async function() {
      */
     function displayDatabaseInfo() {
         if (!dbIndex) return;
-        
+
         const dbInfoElement = document.getElementById('databaseInfo');
         if (!dbInfoElement) return;
-        
+
         dbInfoElement.innerHTML = '';
-        
+
         const currentDbInfo = document.createElement('div');
         currentDbInfo.innerHTML = `
             <h6>Current Database: ${dbIndex.current_db}</h6>
             <p>Available Databases: ${dbIndex.databases.length}</p>
         `;
         dbInfoElement.appendChild(currentDbInfo);
-        
+
         const dbLoadingElement = document.getElementById('dbLoading');
         if (dbLoadingElement) {
             dbLoadingElement.style.display = 'none';
         }
+
+        // Both of these only need dbIndex (a small JSON already in hand) - never
+        // sql.js - so they're safe to build straight away instead of racing a
+        // setTimeout against whatever fetchRelevantDatabases() might be doing.
+        renderRawFileList();
+        addDownloadButton();
     }
-    
+
+    function formatBytes(bytes) {
+        if (!Number.isFinite(bytes) || bytes < 0) return '';
+        if (bytes < 1024) return `${bytes} B`;
+        const units = ['KB', 'MB', 'GB'];
+        let value = bytes;
+        let unit = -1;
+        do {
+            value /= 1024;
+            unit++;
+        } while (value >= 1024 && unit < units.length - 1);
+        return `${value.toFixed(1)} ${units[unit]}`;
+    }
+
+    /**
+     * Render one plain <a href download> per .db file on the card. This is a
+     * native browser download straight from /obd_logs/<filename> - the ESP32
+     * side already streams it in chunks (obd_logger_db_file_handler), and the
+     * browser streams it to disk without ever holding the file in JS memory or
+     * involving sql.js. It works no matter how large the file is or whether
+     * sql.js can parse it at all, and it works even while a chart load is
+     * mid-parse elsewhere on the page, since it needs nothing but dbIndex.
+     */
+    function renderRawFileList() {
+        const listElement = document.getElementById('rawFileList');
+        if (!listElement || !dbIndex) return;
+
+        const files = (dbIndex.databases || []).slice()
+            .sort((a, b) => parseBackendUtcString(b.created) - parseBackendUtcString(a.created));
+
+        if (files.length === 0) {
+            listElement.innerHTML = '<div class="alert alert-warning">No database files found on the card</div>';
+            return;
+        }
+
+        listElement.innerHTML = '';
+        files.forEach(db => {
+            const row = document.createElement('div');
+            row.className = 'form-check d-flex justify-content-between align-items-center mb-2';
+            const isCurrent = db.filename === dbIndex.current_db;
+            row.innerHTML = `
+                <span>
+                    ${db.filename}${isCurrent ? ' <span class="badge bg-primary">current</span>' : ''}
+                    <br><small class="text-muted">${formatBytes(db.size)}</small>
+                </span>
+                <a class="btn btn-sm btn-outline-primary" href="/obd_logs/${encodeURIComponent(db.filename)}" download="${db.filename}">
+                    Download
+                </a>
+            `;
+            listElement.appendChild(row);
+        });
+    }
+
 
     /**
      * Fetch databases relevant to the selected date range
@@ -197,11 +262,12 @@ document.addEventListener('DOMContentLoaded', async function() {
             }
             
             console.log("Loading database file:", filename);
+            const sqlJs = await ensureSqlJs();
             const response = await fetch(`/obd_logs/${filename}`);
             const arrayBuffer = await response.arrayBuffer();
-            
+
             // Create a new database instance
-            const db = new SQL.Database(new Uint8Array(arrayBuffer));
+            const db = new sqlJs.Database(new Uint8Array(arrayBuffer));
             
             // Store the database instance
             loadedDatabases[filename] = {
@@ -657,9 +723,6 @@ async function updateChart() {
         
         dbInfoElement.appendChild(downloadButton);
     }
-    
-    // Add the download button after database info is loaded
-    setTimeout(addDownloadButton, 1500);
     
     // JSZip is required for the download functionality
     if (!window.JSZip) {

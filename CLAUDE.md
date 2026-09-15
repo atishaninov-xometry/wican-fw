@@ -80,16 +80,22 @@ same-day tags so it resets at midnight UTC instead of climbing forever like a ba
     raw 92**, reproduced identically whether using all 32 stopped samples or just the
     7 from the last 5 minutes before shutdown. 136 counts = 27.06 L -> 0.1990 L/count
     -> byte 255 = 50.74 L +/-0.75.
-  - **2026-09-15, 15.0 L**, engine left running the whole stop (no `EngineRPM`==0
-    anywhere near it - `Battery` stayed at 13.0-13.45V throughout, never sagging
-    toward the ~12.8V an alternator cutting out produces, so this is genuinely a
-    fuel stop with the motor idling, not a mis-identified gap). Bracketed instead by
-    `VehicleSpeed`==0: a 252s stop (20:56:28-21:00:40 local) dwarfing every other
-    stop that trip (under 90s). `VehicleSpeed==0`-filtered medians on both sides:
-    before = raw 133 (12 samples over the preceding 30 min, sd 6.4, reproduced
-    exactly by just the last 10 min's 5 samples), after = raw 209 (12 samples over
-    the following 30 min - settles there after one 228 outlier right at pull-away).
-    76 counts = 15.0 L -> 0.1974 L/count -> byte 255 = 50.33 L +/-1.32.
+  - **2026-09-15, 15.0 L.** Engine genuinely was shut off - first analysis pass
+    wrongly concluded otherwise (see the errata note below). The tell that it
+    really was a key-off: **three enormous `BrakePressure` spikes** (6871, 7179,
+    6513 kPa at 20:57:12.6/19.9/24.3 local) that dwarf every ordinary driving-stop
+    peak in the same session (300-1136 kPa) - the driver's own description of
+    pressing the pedal hard three times before getting out. The last spike ends
+    20:57:26.8; `EngineRPM` and `Battery` both go silent a few seconds later and
+    stay silent for ~166-170s (20:57:26/30 -> 21:00:16), matching a real
+    ignition-off, not idling. `VehicleSpeed`==0 the whole time (20:56:28-21:00:40,
+    252s, still the longest stop that session by far).
+    `VehicleSpeed==0`-filtered medians, before-window now extended to the true
+    20:57:30 cutoff: before = raw 133 (13 samples over the preceding 30 min, sd
+    6.2 - unchanged by the extra minute, the one additional sample lands mid-pack),
+    after = raw 209 (12 samples over the following 30 min - settles there after one
+    228 outlier right at pull-away). 76 counts = 15.0 L -> 0.1974 L/count -> byte
+    255 = 50.33 L +/-1.32.
     This also resolves the "half tank -> almost full" confusion the fill prompted:
     against the raw 0-255 byte scale 133->209 is only 52%->82%, but against the
     sender's actual physical ceiling (228, confirmed three times now) it's
@@ -101,11 +107,17 @@ same-day tags so it resets at midnight UTC instead of climbing forever like a ba
     measured.
   - Don't sanity-check a settled reading against samples taken while the car is
     moving - swings of 100+ raw counts from slosh alone are normal even in slow
-    stop-start city traffic, not just highway driving. And don't assume a fuel stop
-    means `EngineRPM`==0 - bracket by `VehicleSpeed`==0 instead when the driver left
-    it running, and use `BatteryVoltage` only to confirm which explanation applies
-    (sagging toward ~12.8V = alternator off = a real key-off; staying above ~13V
-    across the whole stop = engine was idling throughout), not to locate the stop.
+    stop-start city traffic, not just highway driving.
+  - **Errata, worth remembering:** the first pass on the third fill searched for a
+    literal `EngineRPM`==0 *row* and found none, and wrongly concluded the engine
+    had been left idling (a real, embarrassing miss - the driver said outright they
+    shut it off). A genuine key-off doesn't reliably log an explicit 0 first: once
+    ignition drops, the ECU stops answering entirely, so the log just goes silent -
+    no 0 row, just a gap in *every* parameter, `Battery` included. Check for that
+    gap, not for a `==0` transition. Large `BrakePressure` spikes right at the end
+    of a drive are also worth scanning for in general - a hard, deliberate press
+    reads nothing like ordinary braking-to-a-stop and can pinpoint the moment a
+    driver parked to within a couple of seconds.
 - **`TrueSpeed` (`= B3*1.018`, same `01 0D` PID/byte as `VehicleSpeed`, so no extra
   request)**: `VehicleSpeed` is the raw ECU wheel-speed PID, not the dash display, and
   it reads a couple percent *below* true ground speed on this car - the opposite

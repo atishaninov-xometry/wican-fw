@@ -80,14 +80,32 @@ same-day tags so it resets at midnight UTC instead of climbing forever like a ba
     raw 92**, reproduced identically whether using all 32 stopped samples or just the
     7 from the last 5 minutes before shutdown. 136 counts = 27.06 L -> 0.1990 L/count
     -> byte 255 = 50.74 L +/-0.75.
-  - **Combined** (inverse-variance weighted): **0.1981 L/count, byte 255 = 50.5 L
-    +/-0.69** - a real upward revision from 49.04 L (+3.0%), not just confirmation;
-    the two measurements' uncertainty ranges overlap but the second fill's larger
-    delta (136 vs 52 counts) makes it meaningfully more precise. Anchored over
-    16.8-43.9 L combined; linearity below ~17 L is still assumed, not measured.
+  - **2026-09-15, 15.0 L**, engine left running the whole stop (no `EngineRPM`==0
+    anywhere near it - `Battery` stayed at 13.0-13.45V throughout, never sagging
+    toward the ~12.8V an alternator cutting out produces, so this is genuinely a
+    fuel stop with the motor idling, not a mis-identified gap). Bracketed instead by
+    `VehicleSpeed`==0: a 252s stop (20:56:28-21:00:40 local) dwarfing every other
+    stop that trip (under 90s). `VehicleSpeed==0`-filtered medians on both sides:
+    before = raw 133 (12 samples over the preceding 30 min, sd 6.4, reproduced
+    exactly by just the last 10 min's 5 samples), after = raw 209 (12 samples over
+    the following 30 min - settles there after one 228 outlier right at pull-away).
+    76 counts = 15.0 L -> 0.1974 L/count -> byte 255 = 50.33 L +/-1.32.
+    This also resolves the "half tank -> almost full" confusion the fill prompted:
+    against the raw 0-255 byte scale 133->209 is only 52%->82%, but against the
+    sender's actual physical ceiling (228, confirmed three times now) it's
+    58%->92% of *achievable* full - which is exactly "about half" to "almost full".
+  - **Combined, all three fills** (inverse-variance weighted): **0.1979 L/count,
+    byte 255 = 50.47 L +/-0.62** - the third fill lands within 0.2 L of the
+    two-fill estimate above, so the constant in the profile (50.5) stands unchanged.
+    Anchored over 16.8-43.9 L combined; linearity below ~17 L is still assumed, not
+    measured.
   - Don't sanity-check a settled reading against samples taken while the car is
     moving - swings of 100+ raw counts from slosh alone are normal even in slow
-    stop-start city traffic, not just highway driving.
+    stop-start city traffic, not just highway driving. And don't assume a fuel stop
+    means `EngineRPM`==0 - bracket by `VehicleSpeed`==0 instead when the driver left
+    it running, and use `BatteryVoltage` only to confirm which explanation applies
+    (sagging toward ~12.8V = alternator off = a real key-off; staying above ~13V
+    across the whole stop = engine was idling throughout), not to locate the stop.
 - **`TrueSpeed` (`= B3*1.018`, same `01 0D` PID/byte as `VehicleSpeed`, so no extra
   request)**: `VehicleSpeed` is the raw ECU wheel-speed PID, not the dash display, and
   it reads a couple percent *below* true ground speed on this car - the opposite

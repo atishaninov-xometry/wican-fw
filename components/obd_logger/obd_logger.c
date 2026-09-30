@@ -22,7 +22,6 @@
 #include <sys/unistd.h>
 #include <sys/time.h>
 #include <time.h>
-#include <math.h>
 #include <float.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -91,7 +90,6 @@ typedef struct {
     char name[50];
     char type[50];
     char data[128];       // metadata JSON, retained so param_info can be rebuilt after a rotation
-    float last_value;     // last recorded value, for the delta gate
     int64_t last_ts_ms;   // when it was recorded, for the sample-spacing gate (0 = never)
 } param_lookup_t;
 
@@ -838,8 +836,8 @@ esp_err_t obd_logger_init_params(const obd_param_entry_t *param_entries, size_t 
  *
  * Called from the acquisition path, so the sample carries the millisecond
  * timestamp of the value itself rather than that of a later polling tick.
- * Redundant samples are dropped here: at most one per parameter per configured
- * sample spacing, and only when the value actually moved.
+ * Samples closer together than the configured sample spacing are dropped here
+ * (at most one per parameter per spacing). Unchanged values are kept.
  */
 void obd_logger_record_sample(const char *name, float value)
 {
@@ -891,21 +889,17 @@ void obd_logger_record_sample(const char *name, float value)
         return; // not a logged parameter
     }
 
-    if (entry->last_ts_ms != 0)
+    // Only the spacing gate remains. There is deliberately no "value unchanged"
+    // gate: a row means "the ECU answered at this instant", so the absence of a
+    // row means no data. With a delta gate a steady signal and a lost signal
+    // look identical in the file.
+    if (entry->last_ts_ms != 0 &&
+        poll_period > 0 && (now_ms - entry->last_ts_ms) < (int64_t)poll_period)
     {
-        if (poll_period > 0 && (now_ms - entry->last_ts_ms) < (int64_t)poll_period)
-        {
-            xSemaphoreGive(sample_mutex);
-            return;
-        }
-        if (fabsf(value - entry->last_value) <= 0.001f)
-        {
-            xSemaphoreGive(sample_mutex);
-            return;
-        }
+        xSemaphoreGive(sample_mutex);
+        return;
     }
 
-    entry->last_value = value;
     entry->last_ts_ms = now_ms;
 
     if (sample_used < SAMPLE_BUF_ENTRIES)

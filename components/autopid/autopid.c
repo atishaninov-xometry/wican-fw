@@ -128,6 +128,39 @@ static int64_t elm327_autopid_last_cmd_time = 0;
  *   8 chars ("17FE007B", one-token 29-bit)-> no extra skip
  *   1 char  ("6", J1939 "prio PGN SA")    -> skip the 9 chars of "0FEEE 80 " */
 
+// Monotonic time of the last value the vehicle actually answered with (set in
+// autopid_prepare_parameter_value, the funnel every accepted value passes
+// through). 0 = never. Monotonic on purpose: time(NULL) steps when the RTC or
+// NTP corrects the clock.
+static int64_t autopid_last_answer_us = 0;
+
+// How long after the last answer the vehicle still counts as "talking".
+#ifndef AUTOPID_VEHICLE_ALIVE_WINDOW_MS
+#define AUTOPID_VEHICLE_ALIVE_WINDOW_MS 15000
+#endif
+
+// True while the vehicle is still answering requests, i.e. ignition on.
+//
+// The low-voltage pause options exist to stop polling a car that has been shut
+// off (polling can keep a gateway awake and drain the battery). They decide
+// from the supply voltage alone, which fails on cars with a smart alternator:
+// it cycles the system between roughly 12.5 V and 14.2 V *while driving*, so
+// every dip below the threshold paused polling and logging for every parameter
+// at once, for a whole number of the 3 s voltage-read ticks (hundreds of
+// dropouts a week on an ND3). A car that is answering is not shut off, so a low
+// voltage alone must not pause it; the pause applies once the answers have
+// stopped as well.
+static bool autopid_vehicle_recently_answered(void)
+{
+    int64_t last = autopid_last_answer_us;
+
+    if (last == 0)
+    {
+        return false;
+    }
+    return (esp_timer_get_time() - last) < ((int64_t)AUTOPID_VEHICLE_ALIVE_WINDOW_MS * 1000);
+}
+
 static double autopid_round_parameter_value(double value)
 {
     return round(value * 100.0) / 100.0;
@@ -181,6 +214,7 @@ static bool autopid_prepare_parameter_value(parameter_t *param,
     }
 
     *out_value = (float)rounded_value;
+    autopid_last_answer_us = esp_timer_get_time();
 
     // Hand the sample to the logger here, at acquisition time, so the row it
     // writes is stamped with when the value actually arrived. This is the single
@@ -4186,6 +4220,12 @@ static bool autopid_should_pause_pid_polling(float *out_voltage, const char **ou
     if (!autopid_config)
         return false;
 
+    // A vehicle that is still answering is running; low voltage there is the
+    // alternator's charging strategy, not a shut-off car (see
+    // autopid_vehicle_recently_answered).
+    if (autopid_vehicle_recently_answered())
+        return false;
+
     // Mode: disable PID requests when below Power Saving -> Sleep Voltage threshold.
     // Uses dev_status voltage bit (set by sleep_mode task).
     if (autopid_config->disable_pid_requests_on_sleep_voltage && !dev_status_is_wake_voltage_ok())
@@ -4344,7 +4384,8 @@ static void autopid_task(void *pvParameters)
             obd_logger_enable();
         }
 
-        if (autopid_config->disable_on_sleep_voltage && !dev_status_is_wake_voltage_ok())
+        if (autopid_config->disable_on_sleep_voltage && !dev_status_is_wake_voltage_ok() &&
+            !autopid_vehicle_recently_answered())
         {
             ESP_LOGI(TAG, "Voltage below sleep threshold, pausing autopid until voltage recovers");
             obd_logger_disable();

@@ -262,9 +262,11 @@ named wrongly even though its rows end up correct.
 
 ## SD logging facts
 
-- SQLite under `/sdcard/obd_logs`, decoded PIDs only, delta-logging (only changed
-  values written), `synchronous=OFF` during inserts - nothing is durable until
-  checkpoint/unmount, hence the safe-eject/sleep-flush/auto-remount handling.
+- SQLite under `/sdcard/obd_logs`, decoded PIDs only, **every accepted sample is
+  written** (see "Holes in the data" below for why; files from before that change
+  are delta-gated and only rows whose value moved exist), `synchronous=OFF` during
+  inserts - nothing is durable until checkpoint/unmount, hence the
+  safe-eject/sleep-flush/auto-remount handling.
 - Param IDs are per-file (each rotated `.db` recreates `param_info`) - map through
   each file's own `param_info` when merging across files. `db_index.json` is the file
   manifest, and also names the `current_db` that the next boot **reopens and appends
@@ -304,3 +306,71 @@ Fixed by making the chart path fully opt-in and independent of the download path
   a parse that might still be running.
 Net effect: opening the Logger Data tab does no parsing at all until asked, so a file
 too large (or malformed) for sql.js to handle can still always be downloaded plain.
+
+## Holes in the data: the low-voltage pause, and why unchanged values are now written
+
+A week of ND3 driving (`obd_log_20260919_083905_000.db`, 3.1M rows, 37 h of
+logged driving) had holes in every metric, most visibly the slow ones like fuel.
+`tools/logger_gap_report.py <db>` reproduces everything below from a dump.
+
+**Cause of the big holes: the Automate tab's "Low-Voltage Behavior".** Its form
+default is "Pause PID polling only (Custom Voltage)" (`automate_threshold`,
+`pid_polling_min_voltage` 13.1 V when unset), and storing the tab saves whatever the
+select shows. Polling is skipped - and with "Pause Automate" the logger too - while
+the WiCAN's own ADC reading of the OBD supply is below the threshold. That reading
+is refreshed only every 3 s (`sleep_mode.c`), there is no debounce and no
+hysteresis. The ND3's smart alternator cycles system voltage between about 12.5 V
+and 14.2 V *while driving* (ECU `BatteryVoltage`: 25th percentile 13.08 V, 75th
+13.96 V), so every low phase paused the adapter. Evidence, none of it circumstantial:
+- 629 silences with the car moving on both sides (VehicleSpeed > 0, RPM > 500),
+  **all 629 lasting a whole number of 3 s** (+0 .. +0.9 s for the resume re-init); a
+  random duration would match ~42% of the time. Not the 5 s write interval (11%, below
+  chance), not the poll rate, not the SD.
+- ECU battery voltage just before/after those silences: median 12.86/12.89 V, with
+  74%/67% of samples under 13.0 V, against 8% under 13.0 V over all engine-running
+  time (median 13.23 V).
+- It was absent on the first two days (12.5 h + 5 h of driving, with 45% of the
+  voltage samples under 13.1 V on the first) and appears from 09-21 on (4 events on
+  09-20), i.e. it was switched on by a config store or firmware change, not a
+  property of the car alone. Which one, the dump cannot say.
+- Cost: 7.9 h = 17.6% of driving time, every parameter equally (a 100 ms signal
+  just looks dense elsewhere). Worst day 09-25: 313 events, 210 min. A silence
+  ranged from one 3 s tick to 14 min; one of 7 min happened at 154-173 km/h.
+
+**Fuel specifically** (10 s period, ~16.1k rows expected over the driving time, 10.9k
+present = 68%): the pause accounts for ~2.8k of the ~5.2k missing rows, the rest is the
+delta gate - a steady value wrote nothing, which looks identical to a lost sample.
+The same gate is why the slow, steady signals looked worst: CoolantTemperature 40%
+of expected rows, IntakeAirTemperature 52%, BatteryVoltage/Odometer ~70%. Fast
+signals (RPM, load, pedal) only show the pauses.
+
+**Fixes (firmware):**
+1. `obd_logger_record_sample()` no longer has a "value unchanged" gate. Only the
+   per-parameter spacing gate (Logger Sample Interval, default 10 ms) remains, so
+   **a row means the ECU answered, and no row means no data.** Cost is roughly 3x the
+   rows (~300 MB/week at this polling rate, ~19 h of driving per 128 MB file) - SD
+   space was explicitly not a concern. Consequence for any reader: **files written
+   before this change are delta-gated and a single file can contain both regimes**
+   (the DB manager keeps appending to `current_db` across firmware updates), so a gap
+   in one slow parameter is only trustworthy as "no data" for newer rows.
+2. The low-voltage pause no longer applies while the vehicle is still answering
+   (`autopid_vehicle_recently_answered()`: a value was accepted within
+   `AUTOPID_VEHICLE_ALIVE_WINDOW_MS`, 15 s, monotonic clock). After key-off the ECU
+   stops answering, 15 s later the voltage test applies as before, so the original
+   purpose - not poking a shut-off car - is kept. Covers all three modes
+   (Pause Automate, Sleep Voltage, Custom Voltage). Not hardware-tested: only CI-built.
+   If it is ever wrong, the zero-risk switch is Automate -> Low-Voltage Behavior ->
+   Disable.
+
+**Not the cause, checked:** write path (silences are not on the 5 s flush grid; the
+file has no rotation, `integrity_check` ok), polling speed, SD. There is no buffer
+overrun at these rates (8192-entry buffer, ~70 rows/s, flushed every 5 s).
+
+**Still unexplained, small:** on 09-19/09-20 there are ~120 back-to-back intervals of
+~1.3 s between batches (a whole batch arrives in ~80 ms, then nothing for 1.3 s),
+~170 s in total and gone from 09-21. Probably an earlier firmware build; not chased.
+
+**Diagnostic trap worth remembering:** a key-off never logs a final `EngineRPM` of 0,
+so "last RPM > 500 before a silence" does not mean the engine was running - 93
+silences (7.1 h) in this file were the car standing still. Classify by car *moving*
+on both sides before calling a silence a hole.

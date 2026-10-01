@@ -37,6 +37,9 @@ void obd_logger_unlock(void);
 void obd_logger_lock_close(void);
 void obd_logger_unlock_open(void);
 int obd_logger_db_execute(char *sql, obd_logger_db_exec_cb callback, void *callback_arg);
+/* Record the current settings files in the log's settings_log table (changes
+ * only, stamped now). Call after saving config.json or auto_pid.json. */
+void obd_logger_log_settings(void);
 void obd_logger_enable(void);
 void obd_logger_disable(void);
 bool obd_logger_is_enabled(void);

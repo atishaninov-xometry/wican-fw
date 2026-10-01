@@ -374,3 +374,37 @@ overrun at these rates (8192-entry buffer, ~70 rows/s, flushed every 5 s).
 so "last RPM > 500 before a silence" does not mean the engine was running - 93
 silences (7.1 h) in this file were the car standing still. Classify by car *moving*
 on both sides before calling a silence a hole.
+
+## `settings_log`: what the firmware was configured to do when a file was written
+
+Debugging the holes needed to know the Automate tab's low-voltage mode and threshold
+at the time, and the dump could not say (see above). Every log file now carries its
+own settings history:
+
+```sql
+settings_log(timestamp INTEGER, uptime_ms INTEGER, source TEXT, key TEXT,
+             old_value TEXT, new_value TEXT, event TEXT)
+```
+- `source`: `config.json` (Wi-Fi, CAN, sleep voltage/time, MQTT...), `auto_pid.json`
+  (Automate tab: `disable_on_sleep_voltage`, `pid_polling_min_voltage`, the PID list)
+  or `system` (`fw_git_sha`, `idf_version`, `reset_reason` - a changed `fw_git_sha`
+  marks a firmware update).
+- Top-level keys only; a nested value (e.g. the PID list) is stored as compact JSON.
+- `event = 'snapshot'` rows (old NULL) list everything the first time a source is seen
+  in a file - so every rotated file starts self-contained. After that only
+  `event = 'change'` rows are added; `new_value` NULL means the key was removed.
+  The current value of a key is its newest row.
+- When a row is written: at every open of the file (boot, rotation, remount) the
+  settings files are compared with the table; and `store_config` /
+  `store_auto_data` call `obd_logger_log_settings()` right after saving, so a change
+  made in the web UI carries the time of the save (it also checkpoints the WAL,
+  because saving reboots the device). If that is skipped the next boot records the
+  same difference, later. `uptime_ms` (since boot) is immune to RTC steps; the
+  clock-correction pass that fixes `param_data` also shifts this session's
+  `settings_log.timestamp`.
+- Anything whose key contains pass/pwd/secret/token/psk/key is stored as
+  `<redacted>`, so a dump can be shared. Consequence: a change of such a value is
+  invisible. Files from before this feature have no table.
+- `tools/logger_gap_report.py` prints the changes at the end of its report.
+- Logic lives in `components/obd_logger/obd_logger_settings.c` (pure sqlite + cJSON,
+  host-testable); `obd_logger.c` only supplies the file contents and calls it.

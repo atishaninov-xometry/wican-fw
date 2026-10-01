@@ -19,6 +19,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/unistd.h>
 #include <sys/time.h>
 #include <time.h>
@@ -34,7 +35,10 @@
 #include "esp_timer.h"
 #include "string.h"
 #include "rtcm.h"
+#include "esp_system.h"
+#include "hw_config.h"
 #include "obd_logger.h"
+#include "obd_logger_settings.h"
 #include "obd_logger_iface.h"
 #include "obd_logger_db_manager.h"
 
@@ -141,6 +145,8 @@ static int64_t pending_ts_correction_ms = 0;
 // file can hold weeks of already-correct rows - so a clock correction must
 // never touch them. Guarded by db_mutex.
 static int64_t session_first_rowid = 1;
+// Same bound for settings_log, whose timestamps ride along with a clock correction.
+static int64_t session_first_settings_rowid = 1;
 
 // Wall-clock milliseconds, or 0 when the clock is not plausibly set.
 static int64_t obd_logger_wall_clock_ms(void)
@@ -275,6 +281,16 @@ static void obd_logger_apply_ts_correction(void)
                  sqlite3_changes(db_file), session_first_rowid, correction);
     }
 
+    // settings_log shares the clock; its uptime_ms column is the unaffected reference.
+    snprintf(sql, sizeof(sql),
+             "UPDATE settings_log SET timestamp = timestamp + %lld WHERE rowid >= %lld;",
+             correction, session_first_settings_rowid);
+    if (sqlite3_exec(db_file, sql, NULL, NULL, &err) != SQLITE_OK)
+    {
+        ESP_LOGE(TAG, "Failed to move settings_log timestamps: %s", err ? err : "unknown error");
+        sqlite3_free(err);
+    }
+
     xSemaphoreGive(db_mutex);
 }
 
@@ -306,6 +322,112 @@ static void obd_logger_discard_ts_correction(void)
 }
 
 /**
+ * @brief Read a whole settings file into a malloc'ed string, or NULL
+ */
+static char *obd_logger_read_text_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    char *buf = NULL;
+    long size;
+
+    if (f == NULL)
+    {
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) > 0 && fseek(f, 0, SEEK_SET) == 0)
+    {
+        buf = malloc((size_t)size + 1);
+        if (buf != NULL)
+        {
+            size_t got = fread(buf, 1, (size_t)size, f);
+            buf[got] = '\0';
+        }
+    }
+    fclose(f);
+    return buf;
+}
+
+/**
+ * @brief Write whatever differs between the settings files and settings_log
+ *
+ * The first call on a file lists every setting; afterwards only changes are
+ * written, stamped with the time this runs - which for an edit made in the web
+ * UI is the moment of the save (see obd_logger_log_settings()) or, failing
+ * that, the next boot. Caller holds db_mutex.
+ */
+static void obd_logger_log_settings_locked(void)
+{
+    static const char *const files[][2] = {
+        { "config.json",   FS_MOUNT_POINT "/config.json" },
+        { "auto_pid.json", FS_MOUNT_POINT "/auto_pid.json" },
+    };
+    struct timeval tv;
+    int64_t ts_ms = 0;
+    int64_t uptime_ms = esp_timer_get_time() / 1000;
+    int rows = 0;
+    char sys[160];
+
+    if (db_file == NULL)
+    {
+        return;
+    }
+    if (gettimeofday(&tv, NULL) == 0)
+    {
+        ts_ms = (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
+    }
+
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++)
+    {
+        char *text = obd_logger_read_text_file(files[i][1]);
+        if (text != NULL)
+        {
+            int n = obd_logger_settings_record(db_file, files[i][0], text, ts_ms, uptime_ms);
+            rows += n > 0 ? n : 0;
+            free(text);
+        }
+    }
+
+    snprintf(sys, sizeof(sys), "{\"fw_git_sha\":\"%s\",\"idf_version\":\"%s\",\"reset_reason\":\"%d\"}",
+#ifdef GIT_SHA
+             GIT_SHA,
+#else
+             "unknown",
+#endif
+             esp_get_idf_version(), (int)esp_reset_reason());
+    {
+        int n = obd_logger_settings_record(db_file, "system", sys, ts_ms, uptime_ms);
+        rows += n > 0 ? n : 0;
+    }
+
+    if (rows > 0)
+    {
+        ESP_LOGI(TAG, "Recorded %d setting(s) in settings_log", rows);
+    }
+}
+
+/**
+ * @brief Record the settings that were just saved, with the time of the save
+ *
+ * Called by the web UI handlers right after they write config.json or
+ * auto_pid.json. Saving reboots the device a moment later, so the commit is
+ * pushed to the card here; if the card is busy or the log is not open this
+ * does nothing and the next boot records the same difference, later.
+ */
+void obd_logger_log_settings(void)
+{
+    if (db_mutex == NULL || xSemaphoreTake(db_mutex, pdMS_TO_TICKS(3000)) != pdTRUE)
+    {
+        return;
+    }
+    if (db_file != NULL)
+    {
+        obd_logger_log_settings_locked();
+        sqlite3_exec(db_file, "PRAGMA wal_checkpoint(FULL);", NULL, NULL, NULL);
+    }
+    xSemaphoreGive(db_mutex);
+}
+
+/**
  * @brief Note where this session's rows start, for the correction above
  *
  * Call with db_mutex held, right after the database is opened - at boot, after
@@ -334,6 +456,24 @@ static void obd_logger_mark_session_start(void)
     }
 
     ESP_LOGI(TAG, "Clock corrections limited to param_data rowid >= %lld", session_first_rowid);
+
+    // Every open also starts the settings history: this file may be new (rotation)
+    // or carry the previous boot's, and either way it must now say what the
+    // settings are and what changed since it last said so.
+    session_first_settings_rowid = 1;
+    if (obd_logger_settings_create_table(db_file) == 0)
+    {
+        if (sqlite3_prepare_v2(db_file, "SELECT IFNULL(MAX(rowid), 0) FROM settings_log;",
+                               -1, &stmt, NULL) == SQLITE_OK)
+        {
+            if (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                session_first_settings_rowid = sqlite3_column_int64(stmt, 0) + 1;
+            }
+            sqlite3_finalize(stmt);
+        }
+        obd_logger_log_settings_locked();
+    }
 }
 
 /**

@@ -45,6 +45,24 @@ def on_tick(duration_s):
     return -TICK_TOL_LOW <= resid <= TICK_TOL_HIGH
 
 
+def print_settings(con):
+    """Settings the firmware had while this file was written (settings_log)."""
+    try:
+        rows = con.execute("SELECT timestamp, uptime_ms, source, key, old_value, new_value, event "
+                           "FROM settings_log ORDER BY rowid").fetchall()
+    except sqlite3.OperationalError:
+        print("\nsettings_log: none (file written by firmware that predates it)")
+        return
+    snap = [r for r in rows if r[6] == "snapshot"]
+    changes = [r for r in rows if r[6] == "change"]
+    print(f"\nsettings_log: {len(snap)} settings listed, {len(changes)} changes")
+    for r in changes:
+        when = datetime.datetime.fromtimestamp(r[0] / 1000, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        old = "(unset)" if r[4] is None else r[4][:60]
+        new = "(removed)" if r[5] is None else r[5][:60]
+        print(f"  {when} UTC  {r[2]}: {r[3]}  {old} -> {new}")
+
+
 def analyse(path):
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     names = dict(con.execute("SELECT Id, Name FROM param_info"))
@@ -136,6 +154,7 @@ def analyse(path):
     silent = [names[i] for i in names if rows_per_param.get(i, 0) == 0]
     if silent:
         print("  (no rows: " + ", ".join(silent) + ")")
+    print_settings(con)
 
 
 if __name__ == "__main__":

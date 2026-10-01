@@ -86,6 +86,7 @@
 #include "rtcm.h"
 #include "esp_littlefs.h"
 #include "obd_logger_iface.h"
+#include "obd_logger.h"
 #include "https_client_mgr.h"
 #include "sdcard.h"
 #include "obd_logger_db_manager.h"
@@ -1005,6 +1006,11 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 	}
 	fclose(f);
 
+	// Put the saved settings in the current log file now, while the clock still
+	// says when the change was made (the reboot below would only let the next
+	// boot notice it).
+	obd_logger_log_settings();
+
 	// Send success response
 	const char *resp_str = "Configuration saved! Rebooting...";
 	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
@@ -1610,6 +1616,8 @@ static esp_err_t store_auto_data_handler(httpd_req_t *req)
 
 	fclose(f);
 	free(json_buffer);
+
+	obd_logger_log_settings();
 
 	// Send success response
 	const char *resp_str = "Auto PID table will take effect after submit.";

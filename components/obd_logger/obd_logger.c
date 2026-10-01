@@ -36,6 +36,7 @@
 #include "string.h"
 #include "rtcm.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "hw_config.h"
 #include "obd_logger.h"
 #include "obd_logger_settings.h"
@@ -348,6 +349,46 @@ static char *obd_logger_read_text_file(const char *path)
 }
 
 /**
+ * @brief Per-device salt for the credential tags in settings_log
+ *
+ * Kept on the internal filesystem, created on first use, and never copied into
+ * a log file - without it a tag cannot be brute-forced back to a password.
+ */
+static const char *obd_logger_settings_salt(void)
+{
+    static char salt[33];
+
+    if (salt[0] == '\0')
+    {
+        const char *path = FS_MOUNT_POINT "/log_salt";
+        FILE *f = fopen(path, "r");
+
+        if (f != NULL)
+        {
+            size_t n = fread(salt, 1, sizeof(salt) - 1, f);
+            salt[n] = '\0';
+            fclose(f);
+        }
+        if (strlen(salt) < 32)
+        {
+            uint8_t raw[16];
+            esp_fill_random(raw, sizeof(raw));
+            for (int i = 0; i < 16; i++)
+            {
+                snprintf(&salt[i * 2], 3, "%02x", raw[i]);
+            }
+            f = fopen(path, "w");
+            if (f != NULL)
+            {
+                fwrite(salt, 1, 32, f);
+                fclose(f);
+            }
+        }
+    }
+    return salt;
+}
+
+/**
  * @brief Write whatever differs between the settings files and settings_log
  *
  * The first call on a file lists every setting; afterwards only changes are
@@ -381,7 +422,7 @@ static void obd_logger_log_settings_locked(void)
         char *text = obd_logger_read_text_file(files[i][1]);
         if (text != NULL)
         {
-            int n = obd_logger_settings_record(db_file, files[i][0], text, ts_ms, uptime_ms);
+            int n = obd_logger_settings_record(db_file, files[i][0], text, obd_logger_settings_salt(), ts_ms, uptime_ms);
             rows += n > 0 ? n : 0;
             free(text);
         }
@@ -395,7 +436,7 @@ static void obd_logger_log_settings_locked(void)
 #endif
              esp_get_idf_version(), (int)esp_reset_reason());
     {
-        int n = obd_logger_settings_record(db_file, "system", sys, ts_ms, uptime_ms);
+        int n = obd_logger_settings_record(db_file, "system", sys, NULL, ts_ms, uptime_ms);
         rows += n > 0 ? n : 0;
     }
 

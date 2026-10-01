@@ -403,8 +403,12 @@ settings_log(timestamp INTEGER, uptime_ms INTEGER, source TEXT, key TEXT,
   clock-correction pass that fixes `param_data` also shifts this session's
   `settings_log.timestamp`.
 - Anything whose key contains pass/pwd/secret/token/psk/key is stored as
-  `<redacted>`, so a dump can be shared. Consequence: a change of such a value is
-  invisible. Files from before this feature have no table.
+  `<hash:xxxxxxxxxx>`: a 40-bit FNV-1a tag over a per-device salt plus the value. A
+  changed secret therefore shows as a different tag, while the secret itself stays out
+  of the log. The salt is 32 hex chars in `FS_MOUNT_POINT/log_salt` (internal flash,
+  created on first use, never written to a log file), so a dump alone cannot be
+  brute-forced; the tag is not cryptographic, so don't publish the salt. Tags are only
+  comparable within one device. Files from before this feature have no table.
 - `tools/logger_gap_report.py` prints the changes at the end of its report.
 - Logic lives in `components/obd_logger/obd_logger_settings.c` (pure sqlite + cJSON,
   host-testable); `obd_logger.c` only supplies the file contents and calls it.

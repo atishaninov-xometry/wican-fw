@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -36,6 +37,24 @@ static bool key_is_secret(const char *key)
         }
     }
     return false;
+}
+
+/* 64-bit FNV-1a over salt then value. Not a cryptographic hash: what keeps a
+ * dump from revealing a password is that the salt never leaves the device. */
+static void secret_tag(const char *salt, const char *value, char *out, size_t out_len)
+{
+    uint64_t h = 1469598103934665603ULL;
+
+    for (const char *p = salt ? salt : ""; *p; p++)
+    {
+        h = (h ^ (uint8_t)*p) * 1099511628211ULL;
+    }
+    h = (h ^ 0xFF) * 1099511628211ULL;
+    for (const char *p = value; *p; p++)
+    {
+        h = (h ^ (uint8_t)*p) * 1099511628211ULL;
+    }
+    snprintf(out, out_len, "<hash:%010llx>", (unsigned long long)(h & 0xFFFFFFFFFFULL));
 }
 
 /* Text form of a JSON value, malloc'ed: strings raw, everything else compact JSON. */
@@ -113,7 +132,7 @@ static bool source_has_rows(sqlite3 *db, const char *source)
 }
 
 int obd_logger_settings_record(sqlite3 *db, const char *source, const char *json_text,
-                               int64_t ts_ms, int64_t uptime_ms)
+                               const char *salt, int64_t ts_ms, int64_t uptime_ms)
 {
     cJSON *root;
     cJSON *item;
@@ -141,7 +160,15 @@ int obd_logger_settings_record(sqlite3 *db, const char *source, const char *json
         {
             continue;
         }
-        char *now = key_is_secret(item->string) ? strdup(OBD_SETTINGS_REDACTED) : value_text(item);
+        char *now = value_text(item);
+
+        if (now != NULL && key_is_secret(item->string))
+        {
+            char tag[32];
+            secret_tag(salt, now, tag, sizeof(tag));
+            free(now);
+            now = strdup(tag);
+        }
         bool known = false;
         char *before = snapshot ? NULL : last_value(db, source, item->string, &known);
 

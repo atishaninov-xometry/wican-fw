@@ -72,7 +72,7 @@ document.addEventListener('DOMContentLoaded', async function() {
      */
     async function fetchDatabaseIndex() {
         try {
-            const response = await fetch('/obd_logs');
+            const response = await fetch('/obd_logs', { cache: 'no-store' });
             dbIndex = await response.json();
             
             displayDatabaseInfo();
@@ -154,17 +154,25 @@ document.addEventListener('DOMContentLoaded', async function() {
         listElement.innerHTML = '';
         files.forEach(db => {
             const row = document.createElement('div');
-            row.className = 'form-check d-flex justify-content-between align-items-center mb-2';
+            row.className = 'd-flex flex-wrap justify-content-between align-items-center gap-2 mb-3';
             const isCurrent = db.filename === dbIndex.current_db;
+            // The index records a file's size when it is created, so for the file
+            // being written right now it is meaningless; say so instead of showing it.
+            const sizeText = isCurrent ? 'being written now - size grows' : formatBytes(db.size);
             row.innerHTML = `
-                <span>
+                <span style="min-width: 0; overflow-wrap: anywhere;">
                     ${db.filename}${isCurrent ? ' <span class="badge bg-primary">current</span>' : ''}
-                    <br><small class="text-muted">${formatBytes(db.size)}</small>
+                    <br><small class="text-muted">${sizeText}</small>
                 </span>
-                <a class="btn btn-sm btn-outline-primary" href="/obd_logs/${encodeURIComponent(db.filename)}" download="${db.filename}">
+                <a class="btn btn-sm btn-outline-primary" data-base="/obd_logs/${encodeURIComponent(db.filename)}" href="/obd_logs/${encodeURIComponent(db.filename)}" download="${db.filename}">
                     Download
                 </a>
             `;
+            // A fresh URL per click, so a browser cannot answer with an earlier copy
+            // of a file that has grown since.
+            row.querySelector('a').addEventListener('click', ev => {
+                ev.currentTarget.href = ev.currentTarget.dataset.base + '?_=' + Date.now();
+            });
             listElement.appendChild(row);
         });
     }

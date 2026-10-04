@@ -36,6 +36,8 @@
 #include <fcntl.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
+#include "lwip/sockets.h"
 #include "esp_err.h"
 #include "esp_random.h"
 #include "driver/sdmmc_types.h"
@@ -658,6 +660,116 @@ static esp_err_t obd_logger_db_download_handler(httpd_req_t *req)
     return ret;
 }
 
+/**
+ * @brief Send one database file as a plain Content-Length response
+ *
+ * esp_http_server can only answer chunked once the body is streamed, and its
+ * chunk framing is three small socket writes per chunk, which Nagle and the
+ * client's delayed ACK turn into stalls - kilobytes per second on a file this
+ * size. Here the header is written by hand and the body goes out in large
+ * sends with TCP_NODELAY, so the transfer is limited by the SD card and the
+ * radio instead. no-store keeps a browser from handing back an earlier copy of
+ * a file that has since grown.
+ */
+static esp_err_t obd_logger_stream_db_file(httpd_req_t *req, const char *filepath)
+{
+    FILE *file = fopen(filepath, "r");
+    if (!file)
+    {
+        ESP_LOGE(TAG, "Failed to open file: %s", filepath);
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+        return ESP_FAIL;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char *buffer = heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buffer)
+    {
+        ESP_LOGW(TAG, "Internal memory allocation failed, trying PSRAM");
+        buffer = heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!buffer)
+    {
+        ESP_LOGE(TAG, "Failed to allocate memory for file buffer (both internal and PSRAM)");
+        fclose(file);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+
+    const char *name = strrchr(filepath, '/');
+    name = name ? name + 1 : filepath;
+
+    int fd = httpd_req_to_sockfd(req);
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    int hlen = snprintf(buffer, 512,
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/octet-stream\r\n"
+                        "Content-Length: %ld\r\n"
+                        "Content-Disposition: attachment; filename=%s\r\n"
+                        "Cache-Control: no-store\r\n"
+                        "\r\n",
+                        file_size, name);
+
+    esp_err_t ret = ESP_OK;
+    int64_t start_us = esp_timer_get_time();
+    long sent_total = 0;
+    size_t pending = (size_t)hlen;   // header first, then file data in the same buffer
+    size_t bytes_read = 0;
+
+    ESP_LOGI(TAG, "Streaming %s, %ld bytes", filepath, file_size);
+
+    while (ret == ESP_OK)
+    {
+        size_t off = 0;
+        while (off < pending)
+        {
+            int n = send(fd, buffer + off, pending - off, 0);
+            if (n <= 0)
+            {
+                ESP_LOGE(TAG, "File sending failed after %ld of %ld bytes (errno %d)",
+                         sent_total, file_size, errno);
+                ret = ESP_FAIL;
+                break;
+            }
+            off += (size_t)n;
+        }
+        if (ret != ESP_OK)
+        {
+            break;
+        }
+        if (bytes_read > 0)
+        {
+            sent_total += (long)bytes_read;
+        }
+        bytes_read = fread(buffer, 1, CHUNK_SIZE, file);
+        if (bytes_read == 0)
+        {
+            break;
+        }
+        pending = bytes_read;
+    }
+
+    int64_t ms = (esp_timer_get_time() - start_us) / 1000;
+    if (ret == ESP_OK && sent_total != file_size)
+    {
+        // The size was taken up front; if the card could not supply all of it the
+        // client is waiting for bytes that will never come, so drop the connection.
+        ESP_LOGE(TAG, "Short read: sent %ld of %ld bytes", sent_total, file_size);
+        ret = ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Sent %ld bytes in %lld ms (%lld KB/s)", sent_total, ms,
+             ms > 0 ? (long long)(sent_total / ms) : 0LL);
+
+    free(buffer);
+    fclose(file);
+    return ret;
+}
+
 esp_err_t obd_logger_db_file_handler(httpd_req_t *req)
 {
     char filepath[256] = {0};
@@ -668,8 +780,17 @@ esp_err_t obd_logger_db_file_handler(httpd_req_t *req)
     const char *uri = req->uri;
     ESP_LOGI(TAG, "DB file request received: %s", uri);
 
-    // Skip OBD_LOGS_URI prefix
-    const char *filename = uri + strlen(OBD_LOGS_URI);
+    // Skip OBD_LOGS_URI prefix; a query string (the dashboard appends one to
+    // defeat browser caches) is not part of the file name
+    char name_buf[128];
+    strncpy(name_buf, uri + strlen(OBD_LOGS_URI), sizeof(name_buf) - 1);
+    name_buf[sizeof(name_buf) - 1] = '\0';
+    char *query = strchr(name_buf, '?');
+    if (query)
+    {
+        *query = '\0';
+    }
+    const char *filename = name_buf;
 
     // If the path is empty or just "/" - serve the index file
     if (filename[0] == '\0' || (filename[0] == '/' && filename[1] == '\0'))
@@ -779,104 +900,58 @@ esp_err_t obd_logger_db_file_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "Serving file: %s", filepath);
 
-    // Open the file for reading
-    FILE *file = fopen(filepath, "r");
-    if (!file)
+    // Database files are streamed raw (see below). Everything else here is the
+    // small index JSON, which keeps the ordinary chunked path.
+    if (strstr(filepath, ".db") == NULL)
     {
-        ESP_LOGE(TAG, "Failed to open file: %s", filepath);
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
-        return ESP_FAIL;
-    }
-
-    // Get file size
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    char size_str[16];
-    snprintf(size_str, sizeof(size_str), "%ld", file_size);
-    httpd_resp_set_hdr(req, "Content-Length", size_str);
-
-    // Set appropriate content type based on file extension
-    if (strstr(filepath, ".json") != NULL)
-    {
+        FILE *jf = fopen(filepath, "r");
+        if (!jf)
+        {
+            ESP_LOGE(TAG, "Failed to open file: %s", filepath);
+            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+            return ESP_FAIL;
+        }
         httpd_resp_set_type(req, "application/json");
-    }
-    else if (strstr(filepath, ".db") != NULL)
-    {
-        httpd_resp_set_type(req, "application/octet-stream");
-
-        // For database files, set appropriate download headers
-        char content_disposition[280] = {0};
-        const char *filename_only = strrchr(filepath, '/');
-        if (filename_only)
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        char jbuf[512];
+        size_t jn;
+        while ((jn = fread(jbuf, 1, sizeof(jbuf), jf)) > 0)
         {
-            filename_only++; // Skip the slash
+            if (httpd_resp_send_chunk(req, jbuf, jn) != ESP_OK)
+            {
+                ret = ESP_FAIL;
+                break;
+            }
         }
-        else
-        {
-            filename_only = filepath;
-        }
-
-        snprintf(content_disposition, sizeof(content_disposition),
-                 "attachment; filename=%s", filename_only);
-        httpd_resp_set_hdr(req, "Content-Disposition", content_disposition);
+        httpd_resp_send_chunk(req, NULL, 0);
+        fclose(jf);
+        return ret;
     }
 
-    // If it's a DB file and we have an active database, lock it
-    bool is_current_db = strstr(filepath, ".db") != NULL;
+    // The file the logger has open must be closed before it is opened and
+    // measured here. FatFs keeps a file's size and data in the writer's own file
+    // object until it is synced or closed, so a second handle opened earlier sees
+    // the file as it was at the last sync - which is how a download of the
+    // active log can come back without the drive that was just logged. Closing
+    // first (a clean close syncs everything) makes size and content current.
+    // An archived file is not touched by the logger, so logging is left alone
+    // for those.
+    char current_path[128] = {0};
+    bool is_current_db = (obd_db_manager_get_current_path(current_path, sizeof(current_path)) == ESP_OK) &&
+                         strcmp(current_path, filepath) == 0;
     if (is_current_db)
     {
-        obd_logger_lock_close(); // Lock the database to prevent concurrent access
+        obd_logger_lock_close();
     }
 
-    // Read and send file in chunks
-    // First try internal memory for better performance
-    char *buffer = heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ret = obd_logger_stream_db_file(req, filepath);
 
-    // If internal memory allocation fails, try PSRAM as fallback
-    if (!buffer)
-    {
-        ESP_LOGW(TAG, "Internal memory allocation failed, trying PSRAM");
-        buffer = heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    }
-
-    // If both internal and PSRAM allocation fail, handle the error
-    if (!buffer)
-    {
-        ESP_LOGE(TAG, "Failed to allocate memory for file buffer (both internal and PSRAM)");
-        fclose(file);
-        if (is_current_db)
-            obd_logger_unlock_open();
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-        return ESP_FAIL;
-    }
-
-    size_t bytes_read;
-    while ((bytes_read = fread(buffer, 1, CHUNK_SIZE, file)) > 0)
-    {
-        if (httpd_resp_send_chunk(req, buffer, bytes_read) != ESP_OK)
-        {
-            ESP_LOGE(TAG, "File sending failed");
-            ret = ESP_FAIL;
-            break;
-        }
-    }
-
-    // Send empty chunk to signal end of response
-    httpd_resp_send_chunk(req, NULL, 0);
-
-    // Clean up
-    free(buffer);
-    fclose(file);
-
-    // If it was a DB file, unlock it
     if (is_current_db)
     {
         obd_logger_unlock_open();
     }
 
-    ESP_LOGI(TAG, "File send complete: %s", filepath);
+    ESP_LOGI(TAG, "File send %s: %s", (ret == ESP_OK) ? "complete" : "failed", filepath);
     return ret;
 }
 

@@ -74,8 +74,11 @@ const char *sql_param_info =
 // Buffered samples waiting to be written. 16 parameters sampled every 10ms is
 // 1600 samples/s, so this holds a few seconds of worst-case traffic; the task
 // also flushes early once SAMPLE_BUF_HIGH_WATER is crossed, so a fast sample
-// rate cannot overrun a slow SD write interval.
-#define SAMPLE_BUF_ENTRIES 8192
+// rate cannot overrun a slow SD write interval. It also has to ride out a
+// download of the active log file, which holds the database closed for the whole
+// transfer: at the ~70 rows/s this car produces, 32768 entries are ~8 minutes
+// (two PSRAM buffers of 32768 x 16 bytes).
+#define SAMPLE_BUF_ENTRIES 32768
 #define SAMPLE_BUF_HIGH_WATER ((SAMPLE_BUF_ENTRIES * 3) / 4)
 
 // How often the logger task checks whether a flush is due. The samples

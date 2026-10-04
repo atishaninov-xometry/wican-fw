@@ -412,3 +412,38 @@ settings_log(timestamp INTEGER, uptime_ms INTEGER, source TEXT, key TEXT,
 - `tools/logger_gap_report.py` prints the changes at the end of its report.
 - Logic lives in `components/obd_logger/obd_logger_settings.c` (pure sqlite + cJSON,
   host-testable); `obd_logger.c` only supplies the file contents and calls it.
+
+## Downloading `.db` files from the web UI: slow transfers and stale copies
+
+Two problems reported on the Raw Database Files list, with what was found in
+`obd_logger_db_file_handler()` (`components/obd_logger/obd_logger_iface.c`). Neither
+was reproduced on a device - the causes below are from reading the code, the fixes
+are only CI-built.
+
+- **Kilobytes per second on an ~80 MB file.** The handler answered with
+  `httpd_resp_send_chunk()`, whose framing is three small socket writes per chunk
+  (size line, data, CRLF). With Nagle on and the client delaying ACKs, each chunk waits
+  out a timer instead of streaming. It also set `Content-Length` by hand on a
+  response esp_http_server then sent chunked (both headers at once, which is invalid).
+  Now a `.db` is answered with a hand-written header (real `Content-Length`,
+  `Cache-Control: no-store`) and the body goes out in 64 KB `send()`s with
+  `TCP_NODELAY`; the log line `Sent N bytes in M ms (K KB/s)` reports the achieved
+  rate. The small index JSON keeps the chunked path.
+- **Downloading again gave the same file.** Two real mechanisms, both fixed:
+  1. The handler `fopen()`ed and measured the file *before* closing the logger's
+     SQLite connection. FatFs keeps a file's size and unwritten data in the writer's
+     own file object until a sync/close, so a second handle opened earlier sees the
+     file as of the last sync - and the logger runs `synchronous=OFF`, so syncs are
+     rare. The active file is now closed first (a clean close syncs everything), then
+     opened and sized. Archived files are not touched by the logger, so logging is no
+     longer closed for those.
+  2. Nothing told the browser not to reuse an earlier response. Responses now carry
+     `no-store`, the dashboard fetches the index with `cache: 'no-store'` and adds a
+     `?_=<time>` to each download link (the handler strips the query).
+  A third, non-bug cause: the index records a file's `size` when it is created, so the
+  *active* file shows a stale size, and an archived (rotated) file never changes - if
+  that one is downloaded after driving it is expected to be identical. The list now
+  marks the current file and shows "being written now" instead of its size.
+- While the active file is downloading the logger's database is closed and samples
+  wait in RAM. `SAMPLE_BUF_ENTRIES` is now 32768 (~8 min at this car's ~70 rows/s,
+  1 MB of PSRAM per buffer) so a long download no longer overruns it.

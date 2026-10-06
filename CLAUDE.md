@@ -264,9 +264,9 @@ named wrongly even though its rows end up correct.
 
 - SQLite under `/sdcard/obd_logs`, decoded PIDs only, **every accepted sample is
   written** (see "Holes in the data" below for why; files from before that change
-  are delta-gated and only rows whose value moved exist), `synchronous=OFF` during
-  inserts - nothing is durable until checkpoint/unmount, hence the
-  safe-eject/sleep-flush/auto-remount handling.
+  are delta-gated and only rows whose value moved exist). Each flush is synced
+  (`synchronous=FULL`, see "Damaged files" below); the safe-eject/sleep-flush/
+  auto-remount handling closes the connection so even the last flush is complete.
 - Param IDs are per-file (each rotated `.db` recreates `param_info`) - map through
   each file's own `param_info` when merging across files. `db_index.json` is the file
   manifest, and also names the `current_db` that the next boot **reopens and appends
@@ -433,8 +433,8 @@ are only CI-built.
   1. The handler `fopen()`ed and measured the file *before* closing the logger's
      SQLite connection. FatFs keeps a file's size and unwritten data in the writer's
      own file object until a sync/close, so a second handle opened earlier sees the
-     file as of the last sync - and the logger runs `synchronous=OFF`, so syncs are
-     rare. The active file is now closed first (a clean close syncs everything), then
+     file as of the last sync - and the logger then ran `synchronous=OFF`, so syncs were
+     rare (fixed, see below). The active file is now closed first (a clean close syncs everything), then
      opened and sized. Archived files are not touched by the logger, so logging is no
      longer closed for those.
   2. Nothing told the browser not to reuse an earlier response. Responses now carry
@@ -447,3 +447,46 @@ are only CI-built.
 - While the active file is downloading the logger's database is closed and samples
   wait in RAM. `SAMPLE_BUF_ENTRIES` is now 32768 (~8 min at this car's ~70 rows/s,
   1 MB of PSRAM per buffer) so a long download no longer overruns it.
+
+## Damaged files ("database disk image is malformed")
+
+Three dumps copied after a *safe eject* (green LED) would not open. Findings from
+those files (`obd_log_20261002_130721_000.db`, `..._20261005_155852_001.db`, and an
+empty 32 KB `..._155845_000.db` that was fine):
+
+- The b-trees were intact; what was wrong was the *file*. One file (101k rows) had 627
+  pages with a complete tree, but the page count in its header (bytes 28-31) said 622,
+  so SQLite refused every page past 622. Patching that one field gave
+  `integrity_check: ok` and all rows. The other (84k rows, Oct 2 13:07 -> Oct 3 13:38
+  UTC) ended at 511 pages while its interior pages pointed at 512 and 513: its last two
+  leaves, and every row appended after Oct 3 13:38, were not in the file at all (the
+  `settings_log` shows a config save and reboot a minute later).
+- Cause: the flush ran with `PRAGMA synchronous = OFF`, so the COMMIT never synced the
+  file. The card's directory entry (the file size) was only updated on a clean
+  `sqlite3_close()`; pages appended since then reached the card but belonged to a file
+  FatFs still believed was shorter. Anything that ended the session without a close
+  (a config save -> reboot, key-off power loss, a crash) cut the file back to its last
+  close, leaving the tree pointing past the end, and in-place page rewrites (interior
+  pages, page 1) survived unevenly. A proper close - safe eject, rotation - is what
+  *did* make files whole, which is why this only showed up now: sleep/voltage settings
+  changed on Oct 3 (`settings_log`: `sleep_volt` 12.1 -> 12.5 -> 13), so the adapter
+  stopped being shut down cleanly more often. Inferred from the file contents and the
+  code, not reproduced on a device.
+- Fix: flushes now run with `synchronous = FULL` (one `f_sync` per flush, every few
+  seconds), so after any flush the file size on the card is current and a reboot loses
+  at most the unflushed buffer. A torn flush (power lost *during* the ~100 ms write)
+  can still damage a file because the journal is `MEMORY`.
+- One file (the 627-page one) was damaged *despite* a safe eject, which should have
+  closed it cleanly, so the close may have silently failed: `sqlite3_close()` returns
+  BUSY and does nothing while any statement is unfinalized. No leak was found by
+  reading the code, so `obd_logger_close_db()` now finalizes leftovers before every
+  close (eject, download, rotation) and logs a warning naming the statement, or an
+  error if the close still fails - look for `Finalizing a leaked statement` /
+  `sqlite3_close failed` in the device log if it happens again.
+- Salvage: `python3 tools/logger_repair.py damaged.db repaired.db` walks the
+  `param_data` b-tree itself, skips pointers outside the file, and writes a clean
+  database (also copies `param_info` and `settings_log`). On the 627-page file it gave
+  exactly the same rows as the header patch; on the other it recovered every row that
+  reached the card (84183) and reported the two missing pages.
+- When a dump will not open, check `PRAGMA integrity_check`, then compare the header
+  page count with `file_size / 4096`, then run the repair tool.

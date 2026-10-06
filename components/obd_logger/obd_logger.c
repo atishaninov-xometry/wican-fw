@@ -700,6 +700,37 @@ static void obd_logger_repopulate_params(void)
     ESP_LOGI(TAG, "Re-populated param_info with %d parameters after rotation", param_count);
 }
 
+/**
+ * @brief Close the log database, making sure the close really happens
+ *
+ * sqlite3_close() refuses (SQLITE_BUSY) while any prepared statement is still
+ * alive, and then does nothing: the file is never closed, so the card's directory
+ * entry is not updated and a safe eject unmounts a file FatFs still thinks is
+ * short. Finalize anything left over first, and say so when it happens or when
+ * the close still fails. Caller holds db_mutex.
+ */
+static void obd_logger_close_db(void)
+{
+    sqlite3_stmt *leaked;
+    int rc;
+
+    if (db_file == NULL)
+    {
+        return;
+    }
+    while ((leaked = sqlite3_next_stmt(db_file, NULL)) != NULL)
+    {
+        ESP_LOGW(TAG, "Finalizing a leaked statement before closing: %s", sqlite3_sql(leaked));
+        sqlite3_finalize(leaked);
+    }
+    rc = sqlite3_close(db_file);
+    if (rc != SQLITE_OK)
+    {
+        ESP_LOGE(TAG, "sqlite3_close failed (%d) - the file may not be fully written", rc);
+    }
+    db_file = NULL;
+}
+
 static void obd_logger_db_event_handler(obd_db_event_t event, void* event_data)
 {
     switch (event) {
@@ -708,8 +739,7 @@ static void obd_logger_db_event_handler(obd_db_event_t event, void* event_data)
             if (db_file != NULL) {
                 // Close the database but keep the mutex (will be released after rotation)
                 if (xSemaphoreTake(db_mutex, portMAX_DELAY) == pdTRUE) {
-                    sqlite3_close(db_file);
-                    db_file = NULL;
+                    obd_logger_close_db();
                     // Note: We don't release the mutex here, it will be released
                     // after the new database is opened
                 }
@@ -819,10 +849,7 @@ void obd_logger_unlock(void) {
 void obd_logger_lock_close(void) {
     if (db_mutex != NULL) {
         if (xSemaphoreTake(db_mutex, portMAX_DELAY) == pdTRUE) {
-            if (db_file != NULL) {
-                sqlite3_close(db_file);
-                db_file = NULL;
-            }
+            obd_logger_close_db();
             // Note: mutex remains taken until obd_logger_unlock_open is called
         } else {
             ESP_LOGE(TAG, "Failed to take mutex");
@@ -1163,8 +1190,14 @@ static esp_err_t obd_logger_flush_samples(void)
     int64_t start_time = esp_timer_get_time();
     int rc;
 
-    // Temporarily optimize SQLite for maximum performance during bulk insert
-    sqlite3_exec(db_file, "PRAGMA synchronous = OFF;", NULL, NULL, NULL);
+    // Bulk insert in one transaction
+    // MEMORY journal keeps the insert fast, but synchronous must not be OFF: with
+    // OFF the COMMIT never syncs the file, so the card's directory entry (the
+    // file size) stays at whatever the last close wrote while pages keep being
+    // appended past it. A reboot or power cut then leaves a file whose b-tree
+    // points beyond its end - "database disk image is malformed" - and every row
+    // appended since the last close is gone. FULL costs one f_sync per flush.
+    sqlite3_exec(db_file, "PRAGMA synchronous = FULL;", NULL, NULL, NULL);
     sqlite3_exec(db_file, "PRAGMA journal_mode = MEMORY;", NULL, NULL, NULL);
 
     rc = sqlite3_exec(db_file, "BEGIN TRANSACTION;", NULL, NULL, NULL);

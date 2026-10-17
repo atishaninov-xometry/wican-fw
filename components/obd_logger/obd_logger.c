@@ -36,6 +36,7 @@
 #include "string.h"
 #include "rtcm.h"
 #include "esp_system.h"
+#include "restart_tracker.h"
 #include "esp_random.h"
 #include "hw_config.h"
 #include "obd_logger.h"
@@ -413,7 +414,7 @@ static void obd_logger_log_settings_locked(void)
     int64_t ts_ms = 0;
     int64_t uptime_ms = esp_timer_get_time() / 1000;
     int rows = 0;
-    char sys[160];
+    char sys[320];
 
     if (db_file == NULL)
     {
@@ -435,13 +436,35 @@ static void obd_logger_log_settings_locked(void)
         }
     }
 
-    snprintf(sys, sizeof(sys), "{\"fw_git_sha\":\"%s\",\"idf_version\":\"%s\",\"reset_reason\":\"%d\"}",
+    // boot_count changes on every boot (it survives software resets, restarts at 1
+    // after a power loss), so each boot leaves a 'change' row even when the reset
+    // reason is the same as last time - a wake restart looks like any other.
+    restart_tracker_state_t rt = {0};
+    uint32_t boot_count = 0, unexpected_resets = 0;
+    char boot_cause[64] = "unknown";
+    if (restart_tracker_get_state(&rt) == ESP_OK)
+    {
+        boot_count = rt.boot_count;
+        unexpected_resets = rt.unexpected_reset_count;
+    }
+    restart_tracker_record_t last = {0};
+    if (restart_tracker_get_latest_record(&last) == ESP_OK)
+    {
+        // e.g. "software/power_wake/sleep_mode"; planned_reason "none" = nobody asked for it
+        snprintf(boot_cause, sizeof(boot_cause), "%s/%s/%s",
+                 restart_tracker_reset_reason_to_str((esp_reset_reason_t)last.actual_reset_reason),
+                 restart_tracker_planned_reason_to_str((restart_tracker_planned_reason_t)last.planned_reason),
+                 restart_tracker_source_to_str((restart_tracker_source_t)last.source));
+    }
+    snprintf(sys, sizeof(sys),
+             "{\"fw_git_sha\":\"%s\",\"idf_version\":\"%s\",\"reset_reason\":\"%d\","
+             "\"boot_count\":\"%"PRIu32"\",\"unexpected_resets\":\"%"PRIu32"\",\"boot_cause\":\"%s\"}",
 #ifdef GIT_SHA
              GIT_SHA,
 #else
              "unknown",
 #endif
-             esp_get_idf_version(), (int)esp_reset_reason());
+             esp_get_idf_version(), (int)esp_reset_reason(), boot_count, unexpected_resets, boot_cause);
     {
         int n = obd_logger_settings_record(db_file, "system", sys, NULL, ts_ms, uptime_ms);
         rows += n > 0 ? n : 0;

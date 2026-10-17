@@ -572,3 +572,28 @@ of solid green. Reading the code (not reproduced on hardware):
   if it was running, and shows **solid red, held** (card still mounted - do not
   remove it). Red also marks a failed remount. Green = safe to remove, held until the
   next eject/remount; yellow = working; blue = idle.
+
+## First dump from a post-POWERON file (`obd_log_20261010_155710_000.db`)
+
+The file created at the 10-10 15:57:07 POWERON (`settings_log` snapshot 15:57:10,
+`reset_reason` 1, firmware `456f425`), downloaded 10-17: **intact** (`integrity_check`
+ok, header pages = file pages, 444,742 rows, 18 parameters), no dropouts while driving
+(`tools/logger_gap_report.py`: 0 events). It holds 8 drives, all short city runs
+(max 66 km/h), 2.0 h in total, over 5 days:
+10-10 15:57-15:59 (idle, the boot itself), 10-13 17:35-19:14 (4 drives), 10-15
+16:34-18:10 (3 drives). Nothing between 10-10 15:59 and 10-13 17:35 or between 10-13
+19:14 and 10-15 16:34 - whether drives happened then is unknown.
+- **Wake works on this build**: every drive starts with the engine already idling and
+  speed 0, first row within ~10 s of the engine running (10-13 17:35:40 at RPM 1254,
+  coolant 27 C, after the `reset_reason` 1 -> 3 software restart at 17:35:30 = the
+  sleep-wake restart). A 2 min engine-off gap (19:05:40 -> 19:07:58) went to sleep and
+  came back on the next start. No drive started mid-motion, i.e. none lost its
+  beginning. Nothing here shows the missed drives of 10-10; those were in the file
+  orphaned at the POWERON (the previous file, not in this dump).
+- A boot with the *same* reset reason as the last one left no `settings_log` row (only
+  reason changes were recorded), so the later wake restarts are invisible here. The
+  `system` source now also carries `boot_count` (survives software resets, restarts
+  at 1 after a power loss), `unexpected_resets` and `boot_cause`
+  (`<reset reason>/<planned reason>/<source>` of the newest restart_tracker record,
+  e.g. `software/power_wake/sleep_mode`), so every boot - and a power loss, as a
+  `boot_count` that dropped - shows up as a `change` row stamped with `uptime_ms`.

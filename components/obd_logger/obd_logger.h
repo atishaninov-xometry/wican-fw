@@ -35,6 +35,7 @@ void obd_logger_record_sample(const char *name, float value);
 esp_err_t obd_logger_lock(uint32_t wait_ms);
 void obd_logger_unlock(void);
 void obd_logger_lock_close(void);
+esp_err_t obd_logger_lock_close_timeout(uint32_t wait_ms);
 void obd_logger_unlock_open(void);
 int obd_logger_db_execute(char *sql, obd_logger_db_exec_cb callback, void *callback_arg);
 /* Record the current settings files in the log's settings_log table (changes

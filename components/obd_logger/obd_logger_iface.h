@@ -21,6 +21,7 @@
  #ifndef OBD_LOGGER_IFACE_H
  #define OBD_LOGGER_IFACE_H
  
+#include <stdbool.h>
 #include "esp_http_server.h"
 
 extern const httpd_uri_t obd_logger_ws;
@@ -28,6 +29,10 @@ extern const httpd_uri_t db_download_uri;
 extern const httpd_uri_t db_files_uri;
 
 esp_err_t obd_logger_iface_init(void);
+
+/* Make running raw .db downloads stop at their next chunk (set while the SD card is
+ * being ejected so they release the log file), or allow them again. */
+void obd_logger_iface_abort_transfers(bool abort);
  
  #endif /* OBD_LOGGER_IFACE_H */
  

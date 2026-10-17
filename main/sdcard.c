@@ -15,6 +15,7 @@
 #include "filesystem.h"
 #include "restart_tracker.h"
 #include "obd_logger.h"
+#include "obd_logger_iface.h"
 #include "led.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -464,6 +465,38 @@ esp_err_t sdcard_test_rw(void)
     return ESP_OK;
 }
 
+/* The eject/remount result LED (green = safe to remove, red = eject failed) stays
+ * up until the next eject or remount; other LED writers (config mode's blink)
+ * check this so they do not paint over it. */
+static volatile bool s_result_led_held;
+
+bool sdcard_result_led_held(void)
+{
+    return s_result_led_held;
+}
+
+/* Eject failed: card is still mounted and logging carries on. Red, and held. */
+static esp_err_t sdcard_eject_failed(esp_err_t err, const char *why, bool resume_logger, bool db_closed)
+{
+    ESP_LOGE(TAG, "SD eject FAILED (%s): %s - the card is still mounted, do NOT remove it",
+             why, esp_err_to_name(err));
+    obd_logger_iface_abort_transfers(false);
+    if (obd_logger_is_initialized())
+    {
+        if (db_closed)
+        {
+            obd_logger_unlock_open();      /* reopen the DB, release the lock taken by the close */
+        }
+        if (resume_logger)
+        {
+            obd_logger_enable();
+        }
+    }
+    s_result_led_held = true;
+    led_set_level(255, 0, 0);              /* solid red = eject failed, card NOT safe to remove */
+    return err;
+}
+
 esp_err_t sdcard_safe_eject(void)
 {
     if (!s_card_mounted)
@@ -473,31 +506,44 @@ esp_err_t sdcard_safe_eject(void)
     }
 
     ESP_LOGW(TAG, "Preparing SD card for ejection...");
+    s_result_led_held = false;
     led_set_level(255, 255, 0);            /* yellow = working (blue is idle, green is "safe to eject") */
 
+    bool logger_was_enabled = false;
     if (obd_logger_is_initialized())
     {
+        logger_was_enabled = obd_logger_is_enabled();
+        obd_logger_iface_abort_transfers(true);   /* a running download holds the log open */
         obd_logger_disable();              /* stop the logger writing */
         vTaskDelay(pdMS_TO_TICKS(300));    /* let any in-flight write finish */
-        obd_logger_lock_close();           /* checkpoint WAL + sqlite3_close -> flush to .db, hold lock */
+
+        /* checkpoint WAL + sqlite3_close -> flush to .db, hold lock. Bounded: a web
+         * download of the active file holds the lock while it runs. */
+        esp_err_t lret = obd_logger_lock_close_timeout(15000);
+        if (lret != ESP_OK)
+        {
+            return sdcard_eject_failed(lret, "log is busy, a download is still running",
+                                       logger_was_enabled, false);
+        }
     }
 
     esp_err_t ret = sd_card_deinit();      /* unmount FATFS -> flush cache */
-    if (ret == ESP_OK)
+    obd_logger_iface_abort_transfers(false);
+    if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "SD safely unmounted - OK to remove the card.");
-        led_set_level(0, 255, 0);          /* solid green = safe to eject */
+        return sdcard_eject_failed(ret, "unmount failed", logger_was_enabled,
+                                   obd_logger_is_initialized());
     }
-    else
-    {
-        ESP_LOGE(TAG, "Unmount failed: %s", esp_err_to_name(ret));
-        led_set_level(255, 0, 0);          /* red = error */
-    }
+
+    ESP_LOGW(TAG, "SD safely unmounted - OK to remove the card.");
+    s_result_led_held = true;
+    led_set_level(0, 255, 0);              /* solid green = safe to eject */
     return ret;
 }
 
 esp_err_t sdcard_manual_remount(void)
 {
+    s_result_led_held = false;
     led_set_level(255, 255, 0);            /* yellow = working */
     esp_err_t ret = sd_card_init();
     if (ret == ESP_OK)
@@ -514,6 +560,7 @@ esp_err_t sdcard_manual_remount(void)
     else
     {
         ESP_LOGW(TAG, "Remount attempt failed - card not present/readable yet.");
+        s_result_led_held = true;
         led_set_level(255, 0, 0);
     }
     return ret;

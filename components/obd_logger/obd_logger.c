@@ -850,6 +850,26 @@ void obd_logger_unlock(void) {
  * @param db_path Path to the database file
  * @return esp_err_t ESP_OK on success, ESP_FAIL on failure
  */
+/**
+ * @brief Like obd_logger_lock_close(), but gives up after wait_ms
+ *
+ * The mutex is held for as long as a web download of the active file runs, so an
+ * eject that waits forever hangs behind a slow or abandoned transfer.
+ *
+ * @return ESP_OK with the DB closed and the mutex held (release it with
+ *         obd_logger_unlock_open()), ESP_ERR_TIMEOUT if it stayed busy
+ */
+esp_err_t obd_logger_lock_close_timeout(uint32_t wait_ms) {
+    if (db_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(db_mutex, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    obd_logger_close_db();
+    return ESP_OK;
+}
+
 void obd_logger_lock_close(void) {
     if (db_mutex != NULL) {
         if (xSemaphoreTake(db_mutex, portMAX_DELAY) == pdTRUE) {

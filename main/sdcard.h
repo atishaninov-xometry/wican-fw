@@ -1,6 +1,7 @@
 #ifndef SD_CARD_H
 #define SD_CARD_H
 
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -109,6 +110,12 @@ esp_err_t sdcard_perform_ota_update(const char* firmware_path);
  *         an error code if the unmount itself failed.
  */
 esp_err_t sdcard_safe_eject(void);
+
+/**
+ * @brief True while the LED shows the outcome of an eject (green) or a failed
+ * eject/remount (red); other LED users should leave it alone until it clears.
+ */
+bool sdcard_result_led_held(void);
 
 /**
  * @brief Remount the SD card and, if it was initialized, reopen the logger's

@@ -671,6 +671,13 @@ static esp_err_t obd_logger_db_download_handler(httpd_req_t *req)
  * radio instead. no-store keeps a browser from handing back an earlier copy of
  * a file that has since grown.
  */
+static volatile bool s_abort_transfers;
+
+void obd_logger_iface_abort_transfers(bool abort)
+{
+    s_abort_transfers = abort;
+}
+
 static esp_err_t obd_logger_stream_db_file(httpd_req_t *req, const char *filepath)
 {
     FILE *file = fopen(filepath, "r");
@@ -705,6 +712,9 @@ static esp_err_t obd_logger_stream_db_file(httpd_req_t *req, const char *filepat
     int fd = httpd_req_to_sockfd(req);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    // A client that stops reading must not pin the log (and the SD card) forever
+    struct timeval send_timeout = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
 
     int hlen = snprintf(buffer, 512,
                         "HTTP/1.1 200 OK\r\n"
@@ -728,6 +738,12 @@ static esp_err_t obd_logger_stream_db_file(httpd_req_t *req, const char *filepat
         size_t off = 0;
         while (off < pending)
         {
+            if (s_abort_transfers)
+            {
+                ESP_LOGW(TAG, "Download aborted: the SD card is being ejected");
+                ret = ESP_FAIL;
+                break;
+            }
             int n = send(fd, buffer + off, pending - off, 0);
             if (n <= 0)
             {

@@ -547,3 +547,28 @@ reproduced and only CI-built**.
   `format_if_mount_failed = true`.
 - Clock drift (2-3 s/day, jumps) is the RTC without backup supply plus NTP steps; not
   touched.
+
+## Safe eject: the blue/yellow blink, hung ejects, and a red "failed" LED
+
+Owner's sequence: web download of an `.db` was slow/stuck, abandoned, then the button
+was held for eject, once seeing the LED blink blue/green about once a second instead
+of solid green. Reading the code (not reproduced on hardware):
+- **The blink is config mode, not eject.** `main/config_mode.c` counts the button hold
+  too and at 5 s switches to AP+STA and toggles the LED yellow/blue every second
+  forever. The eject task acts at 3 s, so holding the button until the LED changes
+  (or longer) does both, and the config-mode toggle repaints the eject result (yellow
+  next to the green can read as green). The two hold gestures still overlap on a 5 s
+  hold; not changed. The config-mode toggle now skips the LED while
+  `sdcard_result_led_held()`.
+- **Eject used to wait forever behind a download.** A download of the *active* file
+  holds `db_mutex` for its whole run, and `sdcard_safe_eject()` took it with
+  `portMAX_DELAY` (LED stuck yellow, the button task and web handler hung). Now the
+  eject sets `obd_logger_iface_abort_transfers(true)` (the streamer stops at its next
+  chunk), waits at most 15 s (`obd_logger_lock_close_timeout`), and the streamer's
+  socket has a 10 s send timeout so a client that stops reading cannot pin the log.
+- **A failed eject used to leave logging dead.** On an unmount error the DB stayed
+  closed, the lock stayed held and the logger disabled, with a red LED that nothing
+  recovered from. `sdcard_eject_failed()` now reopens the DB, re-enables the logger
+  if it was running, and shows **solid red, held** (card still mounted - do not
+  remove it). Red also marks a failed remount. Green = safe to remove, held until the
+  next eject/remount; yellow = working; blue = idle.

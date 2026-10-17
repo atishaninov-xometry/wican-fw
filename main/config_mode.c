@@ -34,6 +34,7 @@
 #include "dev_status.h"
 #include "ble.h"
 #include "led.h"
+#include "sdcard.h"
 #include <stdbool.h>
 #include "wifi_mgr.h"
 
@@ -56,7 +57,7 @@ void config_mode_task(void *pvParameters)
     for(;;)
     {
         dev_status_wait_for_bits(DEV_AWAKE_BIT, portMAX_DELAY);
-        if (in_config_mode)
+        if (in_config_mode && !sdcard_result_led_held())
         {
             led_set_level(led_on ? LED_MAX_LEVEL : 0,
                           led_on ? LED_MAX_LEVEL : 0,

@@ -490,3 +490,60 @@ empty 32 KB `..._155845_000.db` that was fine):
   reached the card (84183) and reported the two missing pages.
 - When a dump will not open, check `PRAGMA integrity_check`, then compare the header
   page count with `file_size / 4096`, then run the repair tool.
+
+## Missing whole drives (Oct 2026 handover): wake, torn files, double files
+
+Handover: dumps from `456f425` were still truncated, whole drives were missing
+(e.g. 10-10 13:51-14:11, 15:26-15:50 UTC), the device sometimes POWERON-reset at the
+end of a drive and then started a *new* file instead of reopening `current_db`, and
+two files were sometimes created seconds apart. The dumps themselves were not
+available here; everything below is from the code and the handover's facts, **not
+reproduced and only CI-built**.
+
+- **Most likely cause of the missing drives: the adapter was asleep.** Settings were
+  `sleep_volt` 13 (wake at 13.1 V) on a car whose smart alternator regulates 12.5-14.2 V
+  while driving, with the adapter's ADC reading a little below the ECU. Fixes in
+  `main/sleep_mode.c`: (1) the low-voltage -> sleep timer is held while
+  `autopid_vehicle_recently_answered()` (now public) - the car is on whatever the
+  supply says; (2) while asleep the adapter also wakes when the supply rises
+  `WAKE_RISE_V` (0.35 V) above the lowest voltage seen since going to sleep, so it no
+  longer depends on where the absolute threshold sits (confirmed by a second reading
+  in `STATE_WAKE_PENDING`). A voltage-only wake stays marginal on an ND3; lower
+  `sleep_volt` (12.1-12.5) or `periodic_wakeup` are the config-side fallbacks. No
+  CAN-activity wake exists (not added).
+- **A torn current file used to stop logging silently.** `odb_logger_init` aborted
+  when `init_db_tables()` failed, and a file whose last leaves are missing still opens
+  and passes `CREATE TABLE IF NOT EXISTS`, then rejects every insert (SQLITE_CORRUPT)
+  with only a warning per row. Now: an open-time probe (`SELECT rowid ... ORDER BY rowid
+  DESC LIMIT 1`, touches only the right edge of the b-tree, cheap on 128 MB) fails on
+  such a file; init then calls `obd_db_manager_start_new_file()` (quiet, no rotation
+  events - no DB is open yet) and continues in a fresh file. The damaged one stays on
+  the card for `tools/logger_repair.py`. At runtime, 3 flushes in a row where every
+  insert failed (or a closed `db_file` with samples pending) trigger a rotation, at most
+  once a minute and never while `db_mutex` is held (download/eject/sleep close the log
+  on purpose).
+- **POWERON -> new file instead of reopen.** `load_json_index()` fails on an empty index
+  (it was rewritten in place with `fopen("w")`, so a power cut mid-write leaves it
+  empty) and init then created a new DB, orphaning the file being written. The index
+  is now written tmp + fsync + rename (`write_text_file_atomic`, falls back to in-place
+  if rename misbehaves on FatFs), and when the index is unusable
+  `resume_newest_db_file()` picks the newest `obd_log_*.db` below the size limit by
+  mtime (RTC is wrong after power loss, so mtime is only a best guess) and rebuilds the
+  index. Not found: the old behaviour, a new file.
+- **Double files (`_000` + `_001` seconds apart): cause not found.** `_NNN` is a per-boot
+  counter of forced rotations; `_001` means something called `force_rotation()` right
+  after init (only candidates in code: the size check, the web "roll over" button, and
+  now the recovery above). `create_new_db_file()` now also skips a name that already
+  exists (counter restarts every boot, RTC can step back) instead of letting SQLite
+  reopen and append to that file.
+- **Truncated dump despite `synchronous=FULL`: not explained.** Header page count
+  equalled the file's page count, so the file was *consistently short*, i.e. the card's
+  size was behind the data. `xSync` of the SQLite VFS component
+  (`nopnop2002/esp32-idf-sqlite3`) could not be inspected, so `CONFIG_FATFS_IMMEDIATE_FSYNC=y`
+  is set in `sdkconfig` as a lever independent of it (every FatFs write is synced; costs
+  throughput, which is fine at ~70 rows/s). Open: how the dumps were copied (web
+  download vs card reader), whether the card/adapter was unplugged.
+- Still a data-loss risk, not changed: `main/sdcard.c` mounts with
+  `format_if_mount_failed = true`.
+- Clock drift (2-3 s/day, jumps) is the RTC without backup supply plus NTP steps; not
+  touched.

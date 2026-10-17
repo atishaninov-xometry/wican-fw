@@ -85,6 +85,10 @@ const char *sql_param_info =
 // themselves are pushed in by the acquisition path, so this is only a
 // supervisor tick and can stay coarse.
 #define FLUSH_CHECK_PERIOD_MS 50
+// Flushes in a row that stored nothing before the log is replaced by a fresh file
+#define EMPTY_FLUSH_LIMIT 3
+// Never start a replacement file more often than this
+#define RECOVER_MIN_INTERVAL_US (60LL * 1000 * 1000)
 
 typedef struct {
     int64_t ts_ms;
@@ -1145,6 +1149,9 @@ static uint32_t obd_logger_pending_samples(void)
     return pending;
 }
 
+// Consecutive flushes in which every insert failed (see obd_logger_task)
+static uint32_t empty_flush_streak;
+
 /**
  * @brief Write every buffered sample to the database in one transaction
  *
@@ -1224,6 +1231,7 @@ static esp_err_t obd_logger_flush_samples(void)
     }
 
     uint32_t stored = 0;
+    uint32_t failed = 0;
     for (uint32_t i = 0; i < count; i++)
     {
         // Resolve the row id here, not at record time: a rotation between the two
@@ -1240,8 +1248,11 @@ static esp_err_t obd_logger_flush_samples(void)
 
         if (sqlite3_step(stmt) != SQLITE_DONE)
         {
-            ESP_LOGW(TAG, "Failed to insert sample for param %s: %s",
-                     param_lookup[batch[i].param_idx].name, sqlite3_errmsg(db_file));
+            if (failed++ < 3)
+            {
+                ESP_LOGW(TAG, "Failed to insert sample for param %s: %s",
+                         param_lookup[batch[i].param_idx].name, sqlite3_errmsg(db_file));
+            }
         }
         else
         {
@@ -1257,6 +1268,8 @@ static esp_err_t obd_logger_flush_samples(void)
     {
         ESP_LOGE(TAG, "Failed to commit transaction: %s", sqlite3_errmsg(db_file));
         sqlite3_exec(db_file, "ROLLBACK;", NULL, NULL, NULL);
+        stored = 0;
+        failed++;
     }
 
     // Restore normal SQLite settings
@@ -1267,8 +1280,47 @@ static esp_err_t obd_logger_flush_samples(void)
     ESP_LOGI(TAG, "Flushed %"PRIu32"/%"PRIu32" samples in %lld ms",
              stored, count, (end_time - start_time) / 1000);
 
+    // A flush where every insert failed means the file itself is broken (a torn
+    // file rejects each one), not that a single sample was bad.
+    if (stored == 0 && failed > 0)
+    {
+        empty_flush_streak++;
+    }
+    else if (stored > 0)
+    {
+        empty_flush_streak = 0;
+    }
+
     xSemaphoreGive(db_mutex);
     return ESP_OK;
+}
+
+/**
+ * @brief Cheap health check of the just-opened log: can its newest row be read?
+ *
+ * Walking the right edge of param_data touches only the last few pages, so it is
+ * fast on a 128MB file, and it is exactly where a file cut short by a power loss
+ * is broken (interior pages pointing past the end of the file). A damaged file
+ * still opens and the CREATE TABLE IF NOT EXISTS succeeds, but every insert then
+ * fails and logging silently stores nothing. Caller holds db_mutex.
+ */
+static bool obd_logger_probe_db(void)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db_file,
+                                "SELECT rowid FROM param_data ORDER BY rowid DESC LIMIT 1;",
+                                -1, &stmt, NULL);
+    if (rc == SQLITE_OK)
+    {
+        rc = sqlite3_step(stmt);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+    {
+        ESP_LOGE(TAG, "Log file failed the open-time probe (%d): %s", rc, sqlite3_errmsg(db_file));
+        return false;
+    }
+    return true;
 }
 
 static esp_err_t init_db_tables(void)
@@ -1313,6 +1365,13 @@ static esp_err_t init_db_tables(void)
         
         // Increase cache size to reduce disk I/O
         obd_logger_db_exec(db_file, "PRAGMA cache_size = 20000;");
+
+        if (!obd_logger_probe_db())
+        {
+            obd_logger_close_db();
+            xSemaphoreGive(db_mutex);
+            return ESP_ERR_INVALID_CRC;
+        }
 
         // The file may already hold rows from an earlier boot (the DB manager
         // reuses the one db_index.json points at), so record where ours start.
@@ -1538,6 +1597,7 @@ static void obd_logger_task(void *pvParameters)
     obd_logger_enable();
 
     int64_t last_flush_us = esp_timer_get_time();
+    int64_t last_recover_us = -RECOVER_MIN_INTERVAL_US;
 
     while (1)
     {
@@ -1573,6 +1633,24 @@ static void obd_logger_task(void *pvParameters)
                 ESP_LOGE(TAG, "Failed to flush samples to database");
             }
             last_flush_us = now_us;
+        }
+
+        // The log is not taking rows (closed after a failed rotation, or damaged
+        // so that every insert fails): move to a fresh file rather than buffering
+        // into the void until the buffer overruns. Rate-limited, and the old file
+        // stays on the card for tools/logger_repair.py.
+        if ((db_file == NULL || empty_flush_streak >= EMPTY_FLUSH_LIMIT) &&
+            pending > 0 && (now_us - last_recover_us) >= RECOVER_MIN_INTERVAL_US &&
+            // db_mutex held elsewhere = a download, eject or sleep has the log
+            // closed on purpose; leave it alone.
+            xSemaphoreTake(db_mutex, 0) == pdTRUE)
+        {
+            xSemaphoreGive(db_mutex);
+            ESP_LOGE(TAG, "Log not accepting rows (db %s, %"PRIu32" empty flushes): starting a new file",
+                     db_file == NULL ? "closed" : "open", empty_flush_streak);
+            last_recover_us = now_us;
+            empty_flush_streak = 0;
+            obd_db_manager_force_rotation();
         }
 
         vTaskDelay(pdMS_TO_TICKS(FLUSH_CHECK_PERIOD_MS));
@@ -1662,8 +1740,18 @@ esp_err_t odb_logger_init(obd_logger_t *obd_logger)
 
     if(init_db_tables() != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to initialize database tables");
-        return ESP_FAIL;
+        // The file the index points at is damaged (cut short by a power loss) or
+        // will not open. Leave it on the card for tools/logger_repair.py and carry
+        // on in a fresh file - aborting here would mean no logging for the whole
+        // boot, which is exactly how whole drives went missing.
+        ESP_LOGE(TAG, "Current log file is unusable, switching to a new one");
+        if (obd_db_manager_start_new_file() != ESP_OK ||
+            obd_db_manager_get_current_path(db_path, sizeof(db_path)) != ESP_OK ||
+            init_db_tables() != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to initialize database tables");
+            return ESP_FAIL;
+        }
     }
 
     if(obd_logger_init_params(obd_logger->obd_logger_params, obd_logger_params_count) != ESP_OK)

@@ -150,7 +150,7 @@ static int64_t autopid_last_answer_us = 0;
 // dropouts a week on an ND3). A car that is answering is not shut off, so a low
 // voltage alone must not pause it; the pause applies once the answers have
 // stopped as well.
-static bool autopid_vehicle_recently_answered(void)
+bool autopid_vehicle_recently_answered(void)
 {
     int64_t last = autopid_last_answer_us;
 

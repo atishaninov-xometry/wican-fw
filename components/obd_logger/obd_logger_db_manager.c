@@ -56,6 +56,8 @@ static obd_db_manager_t db_manager = {0};
 static esp_err_t create_new_db_file(bool is_init);
 static esp_err_t update_json_index(void);
 static esp_err_t load_json_index(void);
+static esp_err_t write_text_file_atomic(const char *path, const char *text);
+static esp_err_t resume_newest_db_file(void);
 static esp_err_t get_file_size(const char *path, uint32_t *size);
 static void sort_db_files_by_creation_time(obd_db_file_info_t *files, size_t count);
 static void generate_db_filename(char *filename, size_t max_len);
@@ -108,8 +110,21 @@ esp_err_t obd_db_manager_init(const obd_db_manager_config_t *config)
     // Load existing index if available, otherwise create new DB file
     esp_err_t ret = load_json_index();
     if (ret != ESP_OK) {
-        ESP_LOGI(TAG, "No valid index file found, creating new database");
-        ret = create_new_db_file(true);
+        // The index lives on the card and used to be rewritten in place, so a power
+        // cut mid-write leaves it empty. Starting a fresh log then orphans the file
+        // that was being written (and every drive in it looks missing), so keep
+        // appending to the newest log that is already on the card if there is one.
+        ret = resume_newest_db_file();
+        if (ret == ESP_OK) {
+            ESP_LOGW(TAG, "Index file unusable, resumed newest log: %s", db_manager.current_db_path);
+            // Rebuild the index (update_json_index needs the flag); failure is not fatal
+            db_manager.initialized = true;
+            update_json_index();
+            db_manager.initialized = false;
+        } else {
+            ESP_LOGI(TAG, "No valid index file and no existing log, creating new database");
+            ret = create_new_db_file(true);
+        }
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to create initial database file");
             vSemaphoreDelete(db_manager.db_manager_mutex);
@@ -211,6 +226,29 @@ esp_err_t obd_db_manager_force_rotation(void)
     ESP_LOGI(TAG, "Database rotation completed. New file: %s", db_manager.current_db_path);
     
     notify_event(OBD_DB_ROTATION_COMPLETED, NULL);
+    return ret;
+}
+
+/**
+ * @brief Start a fresh log file without any rotation events
+ *
+ * For use before the logger has a database open (boot-time recovery from a damaged
+ * current file): the old file is left on the card untouched for later salvage.
+ */
+esp_err_t obd_db_manager_start_new_file(void)
+{
+    if (!db_manager.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(db_manager.db_manager_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_FAIL;
+    }
+    db_manager.rotation_counter++;
+    esp_err_t ret = create_new_db_file(false);
+    xSemaphoreGive(db_manager.db_manager_mutex);
+    if (ret == ESP_OK) {
+        ESP_LOGW(TAG, "Started a new log file: %s", db_manager.current_db_path);
+    }
     return ret;
 }
 
@@ -548,12 +586,24 @@ esp_err_t obd_db_manager_deinit(void)
 static esp_err_t create_new_db_file(bool is_init)
 {
     char new_filename[64];
-    generate_db_filename(new_filename, sizeof(new_filename));
-    
-    // Create full path
     char new_path[128];
-    snprintf(new_path, sizeof(new_path), "%s/%s", 
+    generate_db_filename(new_filename, sizeof(new_filename));
+    snprintf(new_path, sizeof(new_path), "%s/%s",
             db_manager.config.base_path, new_filename);
+
+    // The sequence number restarts every boot and the clock can step back (a
+    // dead RTC), so a name can already exist. SQLite would happily reopen that
+    // file and append to it; take the next free sequence number instead.
+    for (int tries = 0; tries < 50; tries++) {
+        struct stat existing;
+        if (stat(new_path, &existing) != 0) {
+            break;
+        }
+        db_manager.rotation_counter++;
+        generate_db_filename(new_filename, sizeof(new_filename));
+        snprintf(new_path, sizeof(new_path), "%s/%s",
+                db_manager.config.base_path, new_filename);
+    }
     
     // Save the new path
     strncpy(db_manager.current_db_path, new_path, sizeof(db_manager.current_db_path) - 1);
@@ -566,23 +616,17 @@ static esp_err_t create_new_db_file(bool is_init)
     if (is_init) {
         // For initial creation, just create a basic index file
         // without using functions that check for initialization
-        FILE *index_file = fopen(db_manager.index_file_path, "w");
-        if (index_file == NULL) {
-            ESP_LOGE(TAG, "Failed to create initial index file: %s", strerror(errno));
-            return ESP_FAIL;
-        }
-        
         // Get timestamp for the file creation time
         char timestamp[32];
-        
+
         if (rtcm_get_iso8601_time(timestamp, sizeof(timestamp)) != ESP_OK) {
             // If function fails, set a default timestamp
             strcpy(timestamp, "1970-01-01T00:00:00");
         }
-        
+
         // Create a simple JSON structure manually
         char json_content[300];
-        snprintf(json_content, sizeof(json_content), 
+        snprintf(json_content, sizeof(json_content),
                 "{"
                 "\"current_db\":\"%s\","
                 "\"databases\":["
@@ -593,12 +637,14 @@ static esp_err_t create_new_db_file(bool is_init)
                 "\"status\":\"active\""
                 "}"
                 "]"
-                "}", 
+                "}",
                 new_filename, new_filename, timestamp);
-        
-        fwrite(json_content, 1, strlen(json_content), index_file);
-        fclose(index_file);
-        
+
+        if (write_text_file_atomic(db_manager.index_file_path, json_content) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create initial index file: %s", strerror(errno));
+            return ESP_FAIL;
+        }
+
         return ESP_OK;
     } else {
         // For subsequent rotations, we can use the normal update
@@ -645,7 +691,6 @@ static esp_err_t update_json_index(void)
 {
     obd_db_file_info_t *db_files = NULL;
     size_t num_files = 0;
-    FILE *index_file = NULL;
     cJSON *root = NULL;
     cJSON *databases = NULL;
     esp_err_t ret = ESP_FAIL;
@@ -781,28 +826,16 @@ static esp_err_t update_json_index(void)
         return ESP_FAIL;
     }
     
-    // Write to file
-    index_file = fopen(db_manager.index_file_path, "w");
-    if (index_file == NULL) {
-        ESP_LOGE(TAG, "Failed to open index file for writing: %s", strerror(errno));
-        free(json_str);
-        cJSON_Delete(root);
-        free(db_files);
-        return ESP_FAIL;
-    }
-    
-    size_t written = fwrite(json_str, 1, strlen(json_str), index_file);
-    if (written != strlen(json_str)) {
+    // Write to file (tmp + rename, so a power cut cannot leave an empty index)
+    if (write_text_file_atomic(db_manager.index_file_path, json_str) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write index file: %s", strerror(errno));
-        fclose(index_file);
         free(json_str);
         cJSON_Delete(root);
         free(db_files);
         return ESP_FAIL;
     }
-    
+
     // Cleanup
-    fclose(index_file);
     free(json_str);
     cJSON_Delete(root);
     free(db_files);
@@ -899,6 +932,102 @@ static esp_err_t load_json_index(void)
     ESP_LOGI(TAG, "Current database: %s", db_manager.current_db_path);
     
     cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/**
+ * @brief Replace a small text file without ever exposing a half-written one
+ *
+ * Writes <path>.tmp, syncs it, then renames it over <path>. FatFs refuses to
+ * rename onto an existing file, so the old one is removed first; the window that
+ * leaves is covered by resume_newest_db_file() at boot. If the rename path does
+ * not work at all the file is written in place as before.
+ */
+static esp_err_t write_text_file_atomic(const char *path, const char *text)
+{
+    char tmp_path[144];
+    size_t len = strlen(text);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    FILE *f = fopen(tmp_path, "w");
+    if (f != NULL) {
+        bool ok = fwrite(text, 1, len, f) == len;
+        ok = (fflush(f) == 0) && ok;
+        fsync(fileno(f));
+        ok = (fclose(f) == 0) && ok;
+        if (ok) {
+            if (rename(tmp_path, path) == 0) {
+                return ESP_OK;
+            }
+            remove(path);
+            if (rename(tmp_path, path) == 0) {
+                return ESP_OK;
+            }
+            ESP_LOGW(TAG, "Index rename failed (%s), writing in place", strerror(errno));
+        }
+        remove(tmp_path);
+    }
+
+    f = fopen(path, "w");
+    if (f == NULL) {
+        return ESP_FAIL;
+    }
+    bool ok = fwrite(text, 1, len, f) == len;
+    ok = (fflush(f) == 0) && ok;
+    fsync(fileno(f));
+    ok = (fclose(f) == 0) && ok;
+    return ok ? ESP_OK : ESP_FAIL;
+}
+
+/**
+ * @brief Point current_db_path at the newest log already on the card
+ *
+ * Used when the index is missing/empty/unparsable or names a file that is gone.
+ * Newest = latest modification time; a log that has reached the size limit is
+ * skipped so that the normal rotation does not have to fire immediately.
+ *
+ * @return ESP_OK if a log was chosen, ESP_ERR_NOT_FOUND if the card has none
+ */
+static esp_err_t resume_newest_db_file(void)
+{
+    DIR *dir = opendir(db_manager.config.base_path);
+    if (dir == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    char best[64] = "";
+    time_t best_time = 0;
+    size_t prefix_len = strlen(DB_FILENAME_PREFIX);
+    size_t ext_len = strlen(DB_FILENAME_EXTENSION);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        size_t name_len = strlen(entry->d_name);
+        if (name_len <= prefix_len + ext_len || name_len >= sizeof(best) ||
+            strncmp(entry->d_name, DB_FILENAME_PREFIX, prefix_len) != 0 ||
+            strcmp(entry->d_name + name_len - ext_len, DB_FILENAME_EXTENSION) != 0) {
+            continue;
+        }
+        char full_path[320];
+        snprintf(full_path, sizeof(full_path), "%s/%s", db_manager.config.base_path, entry->d_name);
+        struct stat st;
+        if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        if ((uint32_t)st.st_size >= db_manager.config.max_size_bytes) {
+            continue;
+        }
+        if (best[0] == '\0' || st.st_mtime > best_time) {
+            strcpy(best, entry->d_name);
+            best_time = st.st_mtime;
+        }
+    }
+    closedir(dir);
+
+    if (best[0] == '\0') {
+        return ESP_ERR_NOT_FOUND;
+    }
+    snprintf(db_manager.current_db_path, sizeof(db_manager.current_db_path),
+             "%s/%s", db_manager.config.base_path, best);
     return ESP_OK;
 }
 

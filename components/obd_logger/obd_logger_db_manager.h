@@ -105,6 +105,11 @@ esp_err_t obd_db_manager_force_rotation(void);
 esp_err_t obd_db_manager_check_and_rotate(void);
 
 /**
+ * @brief Switch to a fresh log file without firing rotation events (no DB may be open)
+ */
+esp_err_t obd_db_manager_start_new_file(void);
+
+/**
  * @brief Get a list of all database files
  * 
  * @param db_files Pointer to array of file info structures to fill

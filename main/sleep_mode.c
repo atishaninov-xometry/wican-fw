@@ -56,6 +56,7 @@
 #include "wc_mdns.h"
 #include "vpn_manager.h"
 #include "restart_tracker.h"
+#include "autopid.h"
 
 // #define TAG 		__func__
 #define TAG         "SLEEP_MODE"
@@ -612,6 +613,14 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 #define ADC_GET_DATA(p_data)      ((p_data)->type2.data)
 
 #define CRITICAL_VOLTAGE  11.90f
+
+// While asleep, also wake when the supply rises this far above the lowest voltage
+// seen since going to sleep. The absolute wake threshold (sleep voltage + 0.1 V)
+// can sit inside the band a smart alternator regulates to while driving (12.5-14.2 V
+// on an ND3, with the adapter's own reading a little below the ECU's), so a drive
+// could start without the voltage ever reaching it. The rise is measured against
+// the resting battery instead and is independent of where the threshold was set.
+#define WAKE_RISE_V       0.35f
 #define ERROR_VOLTAGE     12.1f
 
 static adc_oneshot_unit_handle_t adc_handle;
@@ -851,6 +860,7 @@ void light_sleep_task(void *pvParameters)
 	static int8_t periodic_wakeup;
 	static uint32_t wakeup_interval;
 	static wc_timer_t periodic_wakeup_timer;
+    float sleep_floor = 0.0f;   // lowest voltage seen since entering sleep
 
     // Initialize configuration
     sleep_en = config_server_get_sleep_config();
@@ -952,10 +962,19 @@ void light_sleep_task(void *pvParameters)
                         ESP_LOGI(TAG, "Battery voltage recovered (%.2fV)", battery_voltage);
                         current_state = STATE_NORMAL;
                     } 
+                    else if (autopid_vehicle_recently_answered())
+                    {
+                        // The ECU is still answering, so the car is on whatever the supply
+                        // reads (a smart alternator spends long stretches below the sleep
+                        // threshold while driving). Sleeping now would drop the logger
+                        // mid-drive; hold the timer until the car has gone quiet.
+                        wc_timer_set(&sleep_timer, sleep_time);
+                    }
                     else if (wc_timer_is_expired(&sleep_timer))
 					{
                         ESP_LOGI(TAG, "Low voltage timeout expired, entering sleep mode");
                         current_state = STATE_SLEEPING;
+                        sleep_floor = battery_voltage;
                         gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
                         dev_status_clear_bits(DEV_AWAKE_BIT);
                         dev_status_set_bits(DEV_SLEEP_BIT);
@@ -996,11 +1015,22 @@ void light_sleep_task(void *pvParameters)
                     break;
 
                 case STATE_SLEEPING:
+                    if (sleep_floor <= 0.0f || battery_voltage < sleep_floor)
+                    {
+                        sleep_floor = battery_voltage;
+                    }
                     if (battery_voltage >= wakeup_voltage) 
 					{
                         ESP_LOGI(TAG, "Voltage above wakeup threshold, starting wakeup timer");
                         current_state = STATE_WAKE_PENDING;
                         wc_timer_set(&wakeup_timer, 1000); // 2 second timer for stable voltage
+                    }
+                    else if (battery_voltage >= sleep_floor + WAKE_RISE_V)
+                    {
+                        ESP_LOGI(TAG, "Voltage %.2fV is %.2fV above the resting level, starting wakeup timer",
+                                 battery_voltage, battery_voltage - sleep_floor);
+                        current_state = STATE_WAKE_PENDING;
+                        wc_timer_set(&wakeup_timer, 4000); // spans the next 3 s reading, so one blip cannot wake us
                     }
                     else if(battery_voltage > CRITICAL_VOLTAGE && periodic_wakeup && wc_timer_is_expired(&periodic_wakeup_timer))
                     {
@@ -1013,7 +1043,8 @@ void light_sleep_task(void *pvParameters)
                     break;
 
                 case STATE_WAKE_PENDING:
-                    if (battery_voltage < wakeup_voltage) 
+                    if (battery_voltage < wakeup_voltage &&
+                        !(sleep_floor > 0.0f && battery_voltage >= sleep_floor + WAKE_RISE_V)) 
 					{
                         // Voltage dropped again, go back to sleep
                         current_state = STATE_SLEEPING;

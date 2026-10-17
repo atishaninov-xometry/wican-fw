@@ -231,6 +231,14 @@ char *autopid_get_value_by_name(char* name);
 void autopid_publish_all_destinations(void);
 void autopid_app_reset_timer(void);
 
+/**
+ * @brief True while the vehicle is still answering AutoPID requests (a value was
+ * accepted in the last AUTOPID_VEHICLE_ALIVE_WINDOW_MS, 15 s). Means "ignition on",
+ * independent of the supply voltage; used so low voltage alone never pauses polling
+ * or starts the sleep timer on a car that is clearly running.
+ */
+bool autopid_vehicle_recently_answered(void);
+
 // Shared lock for ELM327 access.
 // The AutoPID task uses this mutex to serialize access to the ELM327 interface.
 // Other modules (e.g. AutoPID HTTP test endpoint) should take this lock to
